@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Memory OS 调试台</title>
+  <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%232563eb"/><path d="M18 44V20h7l7 14 7-14h7v24h-6V30l-6 12h-4l-6-12v14z" fill="white"/></svg>'>
+  <style>
+    :root{--bg:#f6f8fb;--panel:#fff;--text:#172033;--muted:#667085;--line:#d9e1ec;--blue:#2563eb;--blue-soft:#eff6ff;--danger:#b42318;--ok:#067647;--shadow:0 8px 24px rgba(16,24,40,.08)}
+    *{box-sizing:border-box}html{min-height:100%}body{min-height:100%;margin:0;background:var(--bg);color:var(--text);font:14px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-y:auto}button,input,textarea,select{font:inherit}
+    main{width:min(1440px,100%);min-height:100vh;margin:0 auto;padding:clamp(10px,2vw,20px);display:flex;flex-direction:column;gap:14px}header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex:0 0 auto}h1{margin:0;font-size:clamp(20px,2.4vw,30px);line-height:1.2}.muted{color:var(--muted)}nav{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;max-width:760px}.tab{border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:10px;padding:9px 12px;cursor:pointer;white-space:nowrap}.tab.active{background:var(--blue);border-color:var(--blue);color:white}
+    section{display:none;min-height:0;flex:1}.visible{display:block}.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;align-items:start}.card{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);padding:14px;display:flex;flex-direction:column;gap:10px}.span-12{grid-column:span 12}.span-8{grid-column:span 8}.span-7{grid-column:span 7}.span-6{grid-column:span 6}.span-5{grid-column:span 5}.span-4{grid-column:span 4}h2{font-size:16px;margin:0;line-height:1.3}.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.toolbar{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.field{min-width:150px;flex:1 1 180px}label{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:10px;background:white;color:var(--text);padding:10px 11px;outline:none;min-width:0}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px var(--blue-soft)}textarea{min-height:92px;resize:vertical}.row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.actions{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.primary{border:1px solid var(--blue);background:var(--blue);color:white;border-radius:10px;padding:10px 14px;cursor:pointer}.primary:disabled{opacity:.6;cursor:wait}.ghost{border:1px solid var(--line);background:white;color:var(--text);border-radius:10px;padding:9px 12px;cursor:pointer}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.metric{min-width:0;background:var(--blue-soft);border-radius:10px;padding:10px}.metric span{display:block;overflow-wrap:anywhere}.metric b{display:block;font-size:clamp(15px,1.8vw,20px);overflow-wrap:anywhere}.badge{display:inline-block;border-radius:999px;padding:3px 8px;font-size:12px;background:#eef2f6;color:var(--muted);max-width:100%;overflow-wrap:anywhere}.badge.ok{background:#ecfdf3;color:var(--ok)}.badge.bad{background:#fef3f2;color:var(--danger)}.scroll{min-height:0;max-height:min(56vh,620px);overflow:auto}.messages{flex:1;min-height:220px;max-height:min(48vh,560px);border:1px solid var(--line);border-radius:12px;background:#fbfcfe;padding:12px}.msg{max-width:82%;padding:9px 11px;border-radius:12px;margin:0 0 10px;overflow-wrap:anywhere}.msg.user{background:var(--blue);color:white;margin-left:auto}.msg.assistant{background:white;border:1px solid var(--line)}table{width:100%;min-width:720px;border-collapse:collapse}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top;overflow-wrap:anywhere}th{font-size:12px;color:var(--muted);font-weight:600}.list{display:grid;gap:10px}.item{min-width:0;border:1px solid var(--line);border-radius:10px;padding:10px;background:#fbfcfe}.item-title{font-weight:650;overflow-wrap:anywhere}.item-meta{color:var(--muted);font-size:12px;margin-top:2px;overflow-wrap:anywhere}pre{max-width:100%;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#fbfcfe;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto}.empty{color:var(--muted)}details{margin-top:8px;min-width:0}summary{cursor:pointer;color:var(--blue);overflow-wrap:anywhere}.error{color:var(--danger)}
+    @media(max-width:1200px){main{max-width:100%;padding:14px}.span-7,.span-8{grid-column:span 12}.span-5,.span-4{grid-column:span 6}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.scroll{max-height:52vh}.messages{max-height:46vh}}
+    @media(max-width:950px){header{display:block}nav{margin-top:12px;max-width:none;justify-content:flex-start;flex-wrap:nowrap;overflow-x:auto;padding-bottom:2px}.grid{grid-template-columns:1fr}.span-12,.span-8,.span-7,.span-6,.span-5,.span-4{grid-column:auto}.row{grid-template-columns:1fr}.messages{max-height:42vh}.msg{max-width:100%}}
+    @media(max-width:640px){main{padding:10px;gap:10px}.card{padding:12px;border-radius:10px}.toolbar{display:grid;grid-template-columns:1fr}.field{min-width:0}.actions{align-items:stretch}.actions .primary,.actions .ghost,.toolbar .primary,.toolbar .ghost{width:100%}.metrics{grid-template-columns:1fr}.scroll{max-height:48vh}.messages{min-height:180px;max-height:40vh}input,textarea,select{padding:9px 10px}.tab{padding:8px 10px}}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>Memory OS 调试台</h1><div class="muted">Enter 发送 · Shift+Enter 换行 · 时间记忆和动作事件自动入库</div></div>
+    <nav>
+      <button class="tab active" data-tab="chat">对话测试</button>
+      <button class="tab" data-tab="longterm">长期记忆</button>
+      <button class="tab" data-tab="timed">时间记忆</button>
+      <button class="tab" data-tab="events">事件库</button>
+      <button class="tab" data-tab="device">设备实时状态</button>
+    </nav>
+  </header>
+
+  <section id="chat" class="visible">
+    <div class="grid">
+      <div class="card span-7">
+        <h2>对话测试</h2>
+        <div class="row">
+          <div><label>user_id</label><input id="chat-user" value="user-001"></div>
+          <div><label>device_id</label><input id="chat-device" value="dog-001"></div>
+        </div>
+        <div class="messages scroll" id="messages"><div class="empty">尚无消息</div></div>
+        <form id="query-form">
+          <label>query</label>
+          <textarea id="query" maxlength="10000" placeholder="明天早上九点给我播放新闻"></textarea>
+          <div class="actions"><span id="request-state" class="muted">等待输入</span><button id="submit" class="primary" type="submit">发送</button></div>
+        </form>
+      </div>
+      <div class="card span-5">
+        <h2>请求指标</h2>
+        <div class="metrics">
+          <div class="metric"><span>总耗时</span><b id="m-total">-</b></div>
+          <div class="metric"><span>模型耗时</span><b id="m-llm">-</b></div>
+          <div class="metric"><span>卡片版本</span><b id="m-card">-</b></div>
+          <div class="metric"><span>摘要版本</span><b id="m-summary">-</b></div>
+        </div>
+        <div class="card-head"><h2>当前上下文</h2><button id="refresh-chat-context" class="ghost" type="button">刷新</button></div>
+        <div id="chat-context" class="scroll list empty">发送后显示用户卡片、摘要、最近消息、最近动作序列</div>
+      </div>
+      <div class="card span-12">
+        <h2>请求链路</h2>
+        <div id="trace-view" class="scroll list empty">发送一条消息后显示输入、摘要、长期记忆、时间记忆、事件写入和回复模型输入输出</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="longterm">
+    <div class="grid">
+      <div class="card span-12"><h2>长期记忆</h2><div class="toolbar"><div class="field"><label>user_id</label><input id="memory-user" value="user-001"></div><div class="field"><label>device_id（摘要筛选可选）</label><input id="memory-device" value="dog-001"></div><button id="load-memory" class="primary">查询</button><button id="run-preference-extract" class="ghost">运行一次偏好抽取</button><button id="delete-memory" class="ghost">清除长期记忆</button></div><div id="extract-result" class="empty">抽取任务状态会显示在这里</div></div>
+      <div class="card span-4"><h2>Redis 用户卡片</h2><pre id="user-card" class="scroll empty">尚未查询</pre></div>
+      <div class="card span-8"><h2>偏好列表</h2><div id="preferences" class="scroll empty">尚未查询</div></div>
+      <div class="card span-6"><h2>滚动摘要</h2><div id="summaries" class="scroll list empty">尚未查询</div></div>
+      <div class="card span-6"><h2>结构化偏好详情</h2><div id="structured-preferences" class="scroll list empty">尚未查询</div></div>
+      <div class="card span-12"><h2>最近原始用户消息</h2><div id="memory-recent-messages" class="scroll list empty">尚未查询</div></div>
+    </div>
+  </section>
+
+  <section id="timed">
+    <div class="grid">
+      <div class="card span-12"><h2>时间记忆</h2><div class="toolbar"><div class="field"><label>user_id</label><input id="time-user" value="user-001"></div><div class="field"><label>device_id</label><input id="time-device" value="dog-001"></div><button id="load-time" class="primary">查询</button></div></div>
+      <div class="card span-5"><h2>手动新增</h2><label>target_at</label><input id="time-target" placeholder="2026-06-26T09:00:00+08:00"><label>内容</label><input id="time-content" placeholder="明天早上九点给我播放新闻"><div class="actions"><span class="muted">对话中可自动识别常见时间表达</span><button id="add-time-memory" class="primary">添加</button></div></div>
+      <div class="card span-7"><h2>时间任务列表</h2><div id="time-memories" class="scroll list empty">尚未查询</div></div>
+    </div>
+  </section>
+
+  <section id="events">
+    <div class="grid">
+      <div class="card span-12"><h2>事件库</h2><div class="toolbar"><div class="field"><label>user_id</label><input id="events-user" value="user-001"></div><div class="field"><label>device_id</label><input id="events-device" value="dog-001"></div><div class="field"><label>event_type</label><select id="events-type"><option value="action_sequence">动作事件</option><option value="">全部事件</option><option value="message">对话消息</option><option value="time_memory">时间/条件记忆</option><option value="scheduled_task">定时任务</option><option value="recurring_task">重复任务</option><option value="conditional_task">条件任务</option><option value="pending_event">待补全事件</option></select></div><button id="load-events" class="primary">筛选</button></div></div>
+      <div class="card span-12"><h2>事件列表</h2><div id="events-table" class="scroll empty">尚未查询</div></div>
+    </div>
+  </section>
+
+  <section id="device">
+    <div class="grid">
+      <div class="card span-12"><h2>设备实时状态</h2><div class="toolbar"><div class="field"><label>device_id</label><input id="status-device" value="dog-001"></div><button id="load-device" class="primary">查询设备</button></div></div>
+      <div class="card span-5">
+        <h2>写入调试状态</h2>
+        <div class="row">
+          <div><label>battery_percent</label><input id="device-battery" type="number" min="0" max="100" value="80"></div>
+          <div><label>charging</label><select id="device-charging"><option value="false">false</option><option value="true">true</option></select></div>
+        </div>
+        <div class="row">
+          <div><label>network</label><select id="device-network"><option>wifi</option><option>4g</option><option>offline</option></select></div>
+          <div><label>motion_state</label><select id="device-motion"><option>idle</option><option>moving</option><option>sitting</option><option>charging</option></select></div>
+        </div>
+        <div class="row">
+          <div><label>location</label><input id="device-location" value="客厅"></div>
+          <div><label>temperature_c</label><input id="device-temperature" type="number" step="0.1" value="36.5"></div>
+        </div>
+        <div class="actions"><span class="muted">Redis 快照过期即离线；SQLite 记录变化历史</span><button id="update-device" class="primary">更新状态</button></div>
+      </div>
+      <div class="card span-7"><h2>当前快照与历史</h2><div id="device-json" class="scroll list empty">尚未查询</div></div>
+    </div>
+  </section>
+</main>
+<script>
+const $=id=>document.getElementById(id), json=v=>JSON.stringify(v,null,2);
+document.querySelectorAll(".tab").forEach(btn=>btn.onclick=()=>{document.querySelectorAll(".tab").forEach(b=>b.classList.remove("active"));document.querySelectorAll("section").forEach(s=>s.classList.remove("visible"));btn.classList.add("active");$(btn.dataset.tab).classList.add("visible")});
+async function fetchJson(url,options){const r=await fetch(url,options);const text=await r.text();let d=null;try{d=text?JSON.parse(text):{}}catch{d={detail:text||`HTTP ${r.status}`}}if(!r.ok)throw new Error(d.detail||d.error||`HTTP ${r.status}`);return d}
+function renderPre(id,value,empty="暂无数据"){const n=$(id);const isEmpty=value==null||(Array.isArray(value)&&!value.length);n.textContent=isEmpty?empty:json(value);n.classList.toggle("empty",isEmpty)}
+function listHtml(items,render){return items&&items.length?items.map(render).join(""):"<div class='empty'>暂无数据</div>"}
+function addMessage(role,text){const box=$("messages");if(box.querySelector(".empty"))box.textContent="";const div=document.createElement("div");div.className=`msg ${role}`;div.textContent=text;box.appendChild(div);box.scrollTop=box.scrollHeight}
+function prefTable(active,candidate){const rows=[...(active||[]),...(candidate||[])];if(!rows.length)return "<span class='empty'>暂无偏好</span>";return `<table><thead><tr><th>中文偏好</th><th>preference_key</th><th>分类</th><th>置信度</th><th>强度</th><th>状态</th><th>证据数</th></tr></thead><tbody>${rows.map(p=>`<tr><td>${p.display_text_zh||""}</td><td>${p.preference_key}</td><td>${p.category}</td><td>${p.confidence}</td><td>${p.strength}</td><td><span class="badge">${p.status}</span></td><td>${p.evidence_count}</td></tr>`).join("")}</tbody></table>`}
+function groupedPrefTable(active,candidate){const rows=[...(active||[]),...(candidate||[])];const groups=[["职业","profile.occupation"],["喜欢","preference.likes"],["明确不喜欢","preference.dislikes"]];const block=(title,key)=>`<div class="item"><div class="item-title">${title}</div>${prefTable(rows.filter(p=>p.preference_key===key),[])}</div>`;const known=new Set(groups.map(g=>g[1]));const other=rows.filter(p=>!known.has(p.preference_key));return groups.map(([title,key])=>block(title,key)).join("")+`<details open><summary>其他 / 历史偏好</summary>${prefTable(other,[])}</details>`}
+function renderStructuredPreferences(active,candidate,evidence){const rows=[...(active||[]),...(candidate||[])];$("structured-preferences").innerHTML=listHtml(rows,p=>`<div class="item"><div class="item-title">${p.display_text_zh||p.preference_key} <span class="badge">${p.status}</span></div><div class="item-meta">${p.preference_key} · ${p.category} · confidence ${p.confidence} · strength ${p.strength}</div><div>${p.reason_zh||""}</div><details><summary>证据与原始数据</summary><pre>${json({preference:p,evidence:(evidence||[]).filter(e=>e.preference_id===p.id)})}</pre></details></div>`)}
+function renderExtractResult(d){const p=d.process||{},errs=p.errors||[],jobs=p.jobs||[],warnings=jobs.filter(j=>j.model_error||j.warning);$("extract-result").classList.remove("empty");const extracted=jobs.map(j=>j.extracted_preferences??0).reduce((a,b)=>a+b,0),stored=jobs.map(j=>j.stored_preferences??0).reduce((a,b)=>a+b,0),inputUsers=jobs.map(j=>j.input_user_events??0).reduce((a,b)=>a+b,0)||(d.input_user_events??0),inputActions=jobs.map(j=>j.input_action_events??0).reduce((a,b)=>a+b,0)||(d.input_action_events??0),ctx=jobs.find(j=>j.preference_context_preview)?.preference_context_preview,errText=errs[0]?.error||"",warnText=warnings[0]?.model_error||warnings[0]?.warning||"";$("extract-result").innerHTML=`<span class="badge ${errs.length?"bad":"ok"}">${errs.length?"失败":warnings.length?"部分成功":"已执行"}</span> ${d.mode||"new_only"} · ${jobs[0]?.context_mode||""} · 事件 ${d.from_event_id??"-"}-${d.to_event_id??"-"} · 输入消息 ${inputUsers} · 输入动作 ${inputActions} · 抽取 ${extracted} · 写入 ${stored} · claimed ${p.claimed??0} · succeeded ${p.succeeded??0} · failed ${p.failed??0}${errText?` · 错误: ${errText.slice(0,160)}`:""}${warnText?` · 模型警告: ${warnText.slice(0,160)}`:""}${d.message?` · ${d.message}`:""}${ctx?`<details open><summary>偏好抽取上下文</summary><pre>${json(ctx)}</pre></details>`:""}<details><summary>抽取诊断</summary><pre>${json({mode:d.mode,force:d.force,latest_event_id:d.latest_event_id,latest_global_event_id:d.latest_global_event_id,latest_processed_event_id:d.latest_processed_event_id,from_event_id:d.from_event_id,to_event_id:d.to_event_id,process:p})}</pre></details>${errs.length||warnings.length?`<details><summary>错误详情</summary><pre>${json({errors:errs,warnings})}</pre></details>`:""}`}
+function renderSummaries(items){$("summaries").innerHTML=listHtml(items,s=>`<div class="item"><div class="item-title">设备 ${s.device_id} · v${s.version}</div><div class="item-meta">压缩事件 ${s.from_event_id??"-"}-${s.to_event_id??s.compacted_through_event_id} · ${s.turn_count??0} 轮 · ${s.created_at}</div><div>${s.summary_text||""}</div></div>`)}
+function renderMemoryRecentMessages(items,deviceId){const rows=(items||[]).filter(m=>!deviceId||m.device_id===deviceId).filter(m=>m.role==="user").slice(0,20);$("memory-recent-messages").innerHTML=listHtml(rows,m=>`<div class="item"><div class="item-title">#${m.id} · ${m.device_id}</div><div class="item-meta">${m.created_at}</div><div>${m.content||""}</div></div>`)}
+function renderTimeMemories(items){$("time-memories").innerHTML=listHtml(items,m=>`<div class="item"><div class="item-title">${m.payload_json?.task||m.content||""}</div><div class="item-meta">目标时间 ${m.payload_json?.target_at||"-"} · 写入 ${m.created_at} · 设备 ${m.device_id}</div><details><summary>原始数据</summary><pre>${json(m)}</pre></details></div>`)}
+function renderEvents(items){$("events-table").innerHTML=listHtml(items,e=>`<div class="item"><div class="item-title">${e.event_type} · ${e.device_id}</div><div class="item-meta">${e.created_at} · ${e.user_id}</div><div>${e.content||""}</div>${e.payload_json?.actions?`<pre>${json(e.payload_json.actions)}</pre>`:""}<details><summary>原始数据</summary><pre>${json(e)}</pre></details></div>`)}
+function renderContext(d){$("chat-context").classList.remove("empty");$("chat-context").innerHTML=`<div class="item"><div class="item-title">用户卡片</div><pre>${json(d.user_card||{})}</pre></div>${listHtml((d.summaries||[]).slice(0,2),s=>`<div class="item"><div class="item-title">摘要 v${s.version} · ${s.device_id}</div><div>${s.summary_text||""}</div></div>`)}<div class="item"><div class="item-title">最近动作序列</div><pre>${json((d.actions||[])[0]||{})}</pre></div><div class="item"><div class="item-title">最近消息</div><pre>${json((d.recent_messages||[]).slice(0,10))}</pre></div>`}
+function renderTrace(steps){$("trace-view").classList.remove("empty");$("trace-view").innerHTML=listHtml(steps,(s,i)=>`<div class="item"><div class="item-title">#${i+1} · ${s.title_zh||s.name} <span class="badge ${s.status==="ok"||s.status==="created"?"ok":""}">${s.status||""}</span></div><div class="item-meta">${s.name||""}${s.duration_ms!=null?` · ${s.duration_ms}ms`:""}</div><details open><summary>查看数据</summary><pre>${json(s.data||{})}</pre></details></div>`)}
+async function loadMemory(){const u=$("memory-user").value.trim(),dev=$("memory-device").value.trim();const d=await fetchJson(`/api/debug/users/${encodeURIComponent(u)}`);renderPre("user-card",d.user_card);$("preferences").innerHTML=groupedPrefTable(d.active_preferences,d.candidate_preferences);renderSummaries(dev?d.summaries.filter(s=>s.device_id===dev):d.summaries);renderStructuredPreferences(d.active_preferences,d.candidate_preferences,d.evidence);renderMemoryRecentMessages(d.recent_messages,dev);return d}
+async function loadTime(){const u=$("time-user").value.trim(),dev=$("time-device").value.trim();const q=dev?`?device_id=${encodeURIComponent(dev)}`:"";const d=await fetchJson(`/api/debug/users/${encodeURIComponent(u)}/time-memories${q}`);renderTimeMemories(d.time_memories);return d}
+async function loadEvents(){const q=new URLSearchParams();const u=$("events-user").value.trim(),dev=$("events-device").value.trim(),type=$("events-type").value;if(u)q.set("user_id",u);if(dev)q.set("device_id",dev);if(type)q.set("event_type",type);const d=await fetchJson(`/api/debug/events?${q}`);renderEvents(d.events);return d}
+async function contextForChat(){const u=$("chat-user").value.trim(),dev=$("chat-device").value.trim();$("memory-user").value=u;$("memory-device").value=dev;$("time-user").value=u;$("time-device").value=dev;$("events-user").value=u;$("events-device").value=dev;const mem=await fetchJson(`/api/debug/users/${encodeURIComponent(u)}`);const actions=await fetchJson(`/api/debug/users/${encodeURIComponent(u)}/actions?device_id=${encodeURIComponent(dev)}`);renderContext({...mem,actions:actions.actions});return mem}
+$("query").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();$("query-form").requestSubmit()}});
+$("query-form").onsubmit=async e=>{e.preventDefault();const user_id=$("chat-user").value.trim(),device_id=$("chat-device").value.trim(),query=$("query").value.trim();if(!user_id||!device_id||!query)return;const btn=$("submit");btn.disabled=true;btn.textContent="发送中";$("request-state").textContent="请求中";addMessage("user",query);try{const data=await fetchJson("/api/query",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({user_id,device_id,query,debug:true})});addMessage("assistant",data.assistant_reply);$("query").value="";$("m-total").textContent=(data.debug?.total_ms??"-")+"ms";$("m-llm").textContent=(data.debug?.llm_ms??"-")+"ms";$("m-card").textContent=data.debug?.user_card_version??"-";$("m-summary").textContent=data.debug?.summary_version??"-";renderTrace(data.debug?.trace_steps||[]);$("request-state").textContent=`完成 ${data.request_id.slice(0,8)}`;await contextForChat();await loadTime()}catch(err){$("request-state").innerHTML=`<span class="error">失败：${err.message}</span>`}finally{btn.disabled=false;btn.textContent="发送";$("query").focus()}};
+$("refresh-chat-context").onclick=async()=>{try{await contextForChat()}catch(e){$("chat-context").innerHTML=`<span class="error">${e.message}</span>`}};
+$("load-memory").onclick=async()=>{try{await loadMemory()}catch(e){$("preferences").innerHTML=`<span class="error">${e.message}</span>`}};
+$("run-preference-extract").onclick=async()=>{const btn=$("run-preference-extract"),u=$("memory-user").value.trim(),dev=$("memory-device").value.trim();if(!u)return;btn.disabled=true;btn.textContent="抽取中";$("extract-result").textContent="正在重跑当前偏好抽取上下文";try{const d=await fetchJson(`/api/debug/users/${encodeURIComponent(u)}/preferences/extract`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({device_id:dev||null,force:true,recent_user_messages:20})});renderExtractResult(d);const mem=d.memory||await loadMemory();renderPre("user-card",mem.user_card);$("preferences").innerHTML=groupedPrefTable(mem.active_preferences,mem.candidate_preferences);renderSummaries(dev?mem.summaries.filter(s=>s.device_id===dev):mem.summaries);renderStructuredPreferences(mem.active_preferences,mem.candidate_preferences,mem.evidence);renderMemoryRecentMessages(mem.recent_messages,dev)}catch(e){$("extract-result").innerHTML=`<span class="error">${e.message}</span>`}finally{btn.disabled=false;btn.textContent="运行一次偏好抽取"}};
+$("delete-memory").onclick=async()=>{const u=$("memory-user").value.trim();if(!u)return;const d=await fetchJson(`/api/debug/users/${encodeURIComponent(u)}/memory`,{method:"DELETE"});renderPre("user-card",d);$("preferences").innerHTML="<span class='empty'>已清除</span>";$("summaries").innerHTML="<span class='empty'>已清除</span>";$("structured-preferences").innerHTML="<span class='empty'>已清除</span>"};
+$("load-time").onclick=async()=>{try{await loadTime()}catch(e){$("time-memories").innerHTML=`<span class="error">${e.message}</span>`}};
+$("add-time-memory").onclick=async()=>{const u=$("time-user").value.trim(),dev=$("time-device").value.trim(),content=$("time-content").value.trim(),target_at=$("time-target").value.trim();if(!u||!dev||!content||!target_at)return;try{const d=await fetchJson(`/api/debug/users/${encodeURIComponent(u)}/time-memories`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({device_id:dev,content,target_at,metadata:{source:"ui"}})});renderTimeMemories(d.time_memories)}catch(e){$("time-memories").innerHTML=`<span class="error">${e.message}</span>`}};
+$("load-events").onclick=async()=>{try{await loadEvents()}catch(e){$("events-table").innerHTML=`<span class="error">${e.message}</span>`}};
+function renderDevice(d){$("device-json").classList.remove("empty");$("device-json").innerHTML=`<div class="item"><div class="item-title">当前状态 <span class="badge ${d.state?.online?"ok":"bad"}">${d.state?.online?"online":"offline"}</span></div><pre>${json(d.state)}</pre></div>${listHtml(d.history,h=>`<div class="item"><div class="item-title">${h.reason} · ${h.observed_at}</div><pre>${json(h.state)}</pre></div>`)}`}
+$("load-device").onclick=async()=>{renderDevice(await fetchJson(`/api/debug/devices/${encodeURIComponent($("status-device").value.trim())}`))};
+$("update-device").onclick=async()=>{try{const device=$("status-device").value.trim(),state={battery_percent:Number($("device-battery").value),charging:$("device-charging").value==="true",network:$("device-network").value,location:$("device-location").value.trim(),motion_state:$("device-motion").value,temperature_c:Number($("device-temperature").value)};const d=await fetchJson(`/api/debug/devices/${encodeURIComponent(device)}/state`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({state})});renderDevice(d)}catch(e){$("device-json").innerHTML=`<span class="error">${e.message}</span>`}};
+$("query").focus();
+</script>
+</body>
+</html>
