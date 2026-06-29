@@ -44,8 +44,9 @@ DELETE /api/debug/users/{user_id}/memory
 ## 运行
 
 ```bash
-ui/.venv/bin/python -m pip install -r ui/requirements.txt
-ui/.venv/bin/uvicorn ui.app:app --reload --host 127.0.0.1 --port 8000
+cd ~/pt/projects/i/memory-os
+uv sync
+REDIS_ALLOW_MEMORY_FALLBACK=true uv run uvicorn ui.app:app --reload --host 127.0.0.1 --port 8000
 ```
 
 生产环境需要 Redis；只有显式开发/测试配置允许内存降级。

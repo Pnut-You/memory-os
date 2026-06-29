@@ -311,6 +311,18 @@ DELETE /api/debug/users/{user_id}/memory
 
 ## 配置
 
+首次运行前先复制配置模板：
+
+```bash
+cp .env.example .env
+```
+
+然后编辑 `.env`，至少填入真实的 `LLM_API_KEY`。如果没有配置这个值，调试 UI 调用模型时会报错：
+
+```text
+LLM request failed: LLM_API_KEY is not configured in .env
+```
+
 `.env.example` 包含：
 
 ```dotenv
@@ -328,26 +340,54 @@ PREFERENCE_EXTRACT_MAX_ATTEMPTS=3
 
 REDIS_URL=redis://localhost:6379/0
 REDIS_TTL_SECONDS=86400
-REDIS_ALLOW_MEMORY_FALLBACK=false
+REDIS_ALLOW_MEMORY_FALLBACK=true
 REDIS_PREFIX=memory-os
 ```
 
-不要写入真实 API Key。未单独填写 `PREFERENCE_EXTRACTOR_API_KEY` 时，偏好抽取器会复用 `LLM_API_KEY`；未单独填写 `PREFERENCE_EXTRACTOR_BASE_URL` 和 `PREFERENCE_EXTRACTOR_MODEL` 时，会复用 `LLM_BASE_URL` 和 `LLM_MODEL`，默认适配智谱 OpenAI-compatible 接口。
+不要把真实 API Key 写入 `.env.example` 或提交到仓库；真实 Key 只放在本机 `.env`。未单独填写 `PREFERENCE_EXTRACTOR_API_KEY` 时，偏好抽取器会复用 `LLM_API_KEY`；未单独填写 `PREFERENCE_EXTRACTOR_BASE_URL` 和 `PREFERENCE_EXTRACTOR_MODEL` 时，会复用 `LLM_BASE_URL` 和 `LLM_MODEL`，默认适配智谱 OpenAI-compatible 接口。
 
 ## 本地运行
+
+本项目现在使用 `uv` 统一管理 Python 虚拟环境和依赖。旧的 `ui/.venv` 已删除，不再使用 `python -m venv ui/.venv`、`pip install -r requirements.txt` 或 `ui/.venv/bin/...`。依赖入口是根目录的 `pyproject.toml` 和 `uv.lock`，`uv sync` 会自动创建或更新根目录 `.venv`。
+
+`uv sync` 的前提是电脑上已经安装过 `uv`。每台新电脑只需要安装一次 `uv`：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv --version
+```
+
+Windows PowerShell：
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+uv --version
+```
+
+第一次安装或同步依赖：
+
+```bash
+uv sync
+```
+
+确认当前 uv 环境：
+
+```bash
+uv run python --version
+uv run python -c "import fastapi, redis, pydantic; print('dependencies ok')"
+```
 
 核心测试：
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 example.py
+uv run python -m unittest discover -s tests -v
+uv run python example.py
 ```
 
 调试 UI：
 
 ```bash
-ui/.venv/bin/python -m pip install -r ui/requirements.txt
-REDIS_ALLOW_MEMORY_FALLBACK=true ui/.venv/bin/uvicorn ui.app:app --reload --host 127.0.0.1 --port 8000
+REDIS_ALLOW_MEMORY_FALLBACK=true uv run uvicorn ui.app:app --reload --host 127.0.0.1 --port 8000
 ```
 
 调试 UI 使用响应式布局，页面整体可滚动，卡片内部按内容区域滚动，适配笔记本、桌面和窄屏浏览器窗口。浏览器自动请求的 `/favicon.ico` 已由 UI 服务兜底返回，不会再产生 404 日志。
@@ -355,7 +395,7 @@ REDIS_ALLOW_MEMORY_FALLBACK=true ui/.venv/bin/uvicorn ui.app:app --reload --host
 如果 `8000` 被占用：
 
 ```bash
-REDIS_ALLOW_MEMORY_FALLBACK=true ui/.venv/bin/uvicorn ui.app:app --reload --host 127.0.0.1 --port 8001
+REDIS_ALLOW_MEMORY_FALLBACK=true uv run uvicorn ui.app:app --reload --host 127.0.0.1 --port 8001
 ```
 
 ## 偏好抽取故障排查
@@ -373,7 +413,7 @@ REDIS_ALLOW_MEMORY_FALLBACK=true ui/.venv/bin/uvicorn ui.app:app --reload --host
 运行：
 
 ```bash
-python3 -m memory.migrate
+uv run python -m memory.migrate
 ```
 
 迁移会：
@@ -388,4 +428,23 @@ python3 -m memory.migrate
 旧数据默认不会进入任何真实用户上下文。
 
 ### 启动命令
-REDIS_ALLOW_MEMORY_FALLBACK=true ui/.venv/bin/python -m uvicorn ui.app:app   --reload   --host 127.0.0.1   --port 8000
+
+```bash
+cd ~/pt/projects/i/memory-os
+
+# 1. 每台电脑先安装一次 uv；如果 uv --version 已正常输出，可跳过
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. 安装依赖并创建根目录 .venv，只需要第一次执行或依赖变化时执行
+uv sync
+
+# 3. 首次运行前复制 .env 并填写 LLM_API_KEY
+cp .env.example .env
+
+# 4. 启动项目
+REDIS_ALLOW_MEMORY_FALLBACK=true \
+uv run uvicorn ui.app:app \
+  --reload \
+  --host 127.0.0.1 \
+  --port 8000
+```

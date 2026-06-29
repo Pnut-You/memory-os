@@ -146,8 +146,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if find_spec("redis") is None:
             raise RuntimeError(
                 "Redis server may be running, but the Python 'redis' client is missing from "
-                "this UI environment. Install it with: "
-                "ui/.venv/bin/python -m pip install -r ui/requirements.txt"
+                "this UI environment. Install dependencies with: uv sync"
             )
         config = MemoryConfig.from_env()
         manager = MemoryManager.create(config, start_scheduler=True)

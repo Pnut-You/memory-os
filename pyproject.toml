@@ -1,0 +1,17 @@
+[project]
+name = "memory-os"
+version = "0.1.0"
+description = "Bare Python layered memory module for agents, IoT devices, and robot dogs."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx[socks]>=0.25,<1",
+    "openai>=1,<3",
+    "pydantic>=2.9,<3",
+    "redis>=5.0,<7",
+    "uvicorn>=0.34,<1",
+]
+
+[tool.uv]
+package = false
