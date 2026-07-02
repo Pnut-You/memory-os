@@ -9,9 +9,22 @@ from pathlib import Path
 from .utils import load_dotenv
 
 
+QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+QWEN_CHAT_MODEL = "qwen3.7-plus"
+QWEN_MEMORY_MODEL = "qwen3.7-max"
+
+
 def _bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     return default if value is None else value.lower() in {"1", "true", "yes", "on"}
+
+
+def _first_env(names: tuple[str, ...]) -> tuple[str, str]:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value, name
+    return "", ""
 
 
 @dataclass(slots=True)
@@ -27,13 +40,15 @@ class MemoryConfig:
     device_heartbeat_seconds: int = 300
     tool_run_ttl_seconds: int = 3600
     llm_api_key: str = ""
-    llm_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4.1-mini"
+    llm_api_key_source: str = ""
+    llm_base_url: str = QWEN_BASE_URL
+    llm_model: str = QWEN_CHAT_MODEL
     summary_every_turns: int = 10
     summary_retain_turns: int = 5
     preference_extractor_enabled: bool = True
     preference_extractor_base_url: str = ""
     preference_extractor_api_key: str = ""
+    preference_extractor_api_key_source: str = ""
     preference_extractor_model: str = ""
     preference_extract_batch_size: int = 8
     preference_extract_min_new_user_messages: int = 10
@@ -43,6 +58,10 @@ class MemoryConfig:
     def from_env(cls, env_file: str | Path = ".env") -> "MemoryConfig":
         load_dotenv(env_file)
         data_dir = Path(os.getenv("MEMORY_DATA_DIR", "data"))
+        llm_api_key, llm_api_key_source = _first_env(("DASHSCOPE_API_KEY", "LLM_API_KEY"))
+        preference_api_key, preference_api_key_source = _first_env(
+            ("PREFERENCE_EXTRACTOR_API_KEY", "DASHSCOPE_API_KEY", "LLM_API_KEY")
+        )
         return cls(
             data_dir=data_dir,
             sqlite_path=Path(os.getenv("MEMORY_SQLITE_PATH", str(data_dir / "events.db"))),
@@ -56,18 +75,19 @@ class MemoryConfig:
             device_state_ttl_seconds=max(1, int(os.getenv("DEVICE_STATE_TTL_SECONDS", "120"))),
             device_heartbeat_seconds=max(1, int(os.getenv("DEVICE_HEARTBEAT_SECONDS", "300"))),
             tool_run_ttl_seconds=max(1, int(os.getenv("TOOL_RUN_TTL_SECONDS", "3600"))),
-            llm_api_key=os.getenv("LLM_API_KEY", ""),
-            llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
-            llm_model=os.getenv("LLM_MODEL", "gpt-4.1-mini"),
+            llm_api_key=llm_api_key,
+            llm_api_key_source=llm_api_key_source,
+            llm_base_url=os.getenv("LLM_BASE_URL", QWEN_BASE_URL),
+            llm_model=os.getenv("LLM_MODEL", QWEN_CHAT_MODEL),
             summary_every_turns=max(1, int(os.getenv("SUMMARY_EVERY_TURNS", "10"))),
             summary_retain_turns=max(1, int(os.getenv("SUMMARY_RETAIN_TURNS", "5"))),
             preference_extractor_enabled=_bool("PREFERENCE_EXTRACTOR_ENABLED", True),
             preference_extractor_base_url=os.getenv("PREFERENCE_EXTRACTOR_BASE_URL")
-            or os.getenv("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
-            preference_extractor_api_key=os.getenv("PREFERENCE_EXTRACTOR_API_KEY")
-            or os.getenv("LLM_API_KEY", ""),
+            or os.getenv("LLM_BASE_URL", QWEN_BASE_URL),
+            preference_extractor_api_key=preference_api_key,
+            preference_extractor_api_key_source=preference_api_key_source,
             preference_extractor_model=os.getenv("PREFERENCE_EXTRACTOR_MODEL")
-            or os.getenv("LLM_MODEL", "glm-4-flash"),
+            or QWEN_MEMORY_MODEL,
             preference_extract_batch_size=max(1, int(os.getenv("PREFERENCE_EXTRACT_BATCH_SIZE", "8"))),
             preference_extract_min_new_user_messages=max(
                 1, int(os.getenv("PREFERENCE_EXTRACT_MIN_NEW_USER_MESSAGES", "10"))

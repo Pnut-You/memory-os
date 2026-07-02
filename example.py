@@ -1,5 +1,7 @@
 """Run with: python3 example.py"""
 
+import uuid
+
 from memory import MemoryConfig, MemoryManager
 
 
@@ -9,7 +11,7 @@ def main() -> None:
     memory = MemoryManager.create(config, start_scheduler=False)
     try:
         memory.add_conversation_turn(
-            "demo-1",
+            f"demo-{uuid.uuid4().hex}",
             "user-001",
             "dog-001",
             "我喜欢安静一点的路线。",

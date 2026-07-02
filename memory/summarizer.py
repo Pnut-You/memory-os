@@ -7,11 +7,13 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from .config import QWEN_BASE_URL, QWEN_CHAT_MODEL
+
 
 class Summarizer:
     MAX_SUMMARY_CHARS = 1600
 
-    def __init__(self, api_key: str = "", base_url: str = "https://api.openai.com/v1", model: str = "gpt-4.1-mini") -> None:
+    def __init__(self, api_key: str = "", base_url: str = QWEN_BASE_URL, model: str = QWEN_CHAT_MODEL) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -77,4 +79,4 @@ class Summarizer:
         new_part = "\n".join(lines[-40:])
         if previous_summary:
             return (previous_summary + "\n" + new_part)[-Summarizer.MAX_SUMMARY_CHARS :]
-        return ("对话摘要（本地规则生成）\n" + new_part)[-Summarizer.MAX_SUMMARY_CHARS :]
+        return ("对话摘要（本地摘要生成）\n" + new_part)[-Summarizer.MAX_SUMMARY_CHARS :]

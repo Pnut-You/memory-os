@@ -579,7 +579,7 @@ class SQLiteEventStore:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         params: list[Any] = [user_id]
-        where = "WHERE user_id=? AND event_type IN ('time_memory','scheduled_task','recurring_task','conditional_task','pending_event')"
+        where = "WHERE user_id=? AND event_type='time_memory'"
         if device_id:
             where += " AND device_id=?"
             params.append(device_id)
@@ -589,6 +589,38 @@ class SQLiteEventStore:
                 f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ?", params
             ).fetchall()
         return [self._decode_row(row, ("payload_json",)) for row in rows]
+
+    def add_event_summary(
+        self,
+        user_id: str,
+        device_id: str,
+        content: str,
+        event_at: str | None = None,
+        title: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        payload = {
+            "event_at": event_at or iso_now(),
+            "title": title,
+            "source": (metadata or {}).get("source", "manual"),
+            "metadata": dict(metadata or {}),
+        }
+        return self.add_event(
+            f"event-summary-{user_id}-{device_id}-{iso_now()}",
+            user_id,
+            device_id,
+            "event_summary",
+            payload,
+            content=content,
+        )
+
+    def list_event_summaries(
+        self,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self.list_events(user_id=user_id, device_id=device_id, event_type="event_summary", limit=limit)
 
     def list_action_events(
         self,
@@ -1142,8 +1174,19 @@ class SQLiteEventStore:
                 counts[table] = cursor.rowcount
             cursor = self._conn.execute(
                 """DELETE FROM events
+                WHERE user_id=? AND event_type='time_memory'""",
+                (user_id,),
+            )
+            counts["time_memories"] = cursor.rowcount
+            cursor = self._conn.execute(
+                """DELETE FROM events
+                WHERE user_id=? AND event_type='event_summary'""",
+                (user_id,),
+            )
+            counts["event_summaries"] = cursor.rowcount
+            cursor = self._conn.execute(
+                """DELETE FROM events
                 WHERE user_id=? AND event_type IN (
-                    'time_memory',
                     'scheduled_task',
                     'recurring_task',
                     'conditional_task',
@@ -1151,7 +1194,7 @@ class SQLiteEventStore:
                 )""",
                 (user_id,),
             )
-            counts["time_memories"] = cursor.rowcount
+            counts["legacy_time_events"] = cursor.rowcount
             self._conn.commit()
         return counts
 

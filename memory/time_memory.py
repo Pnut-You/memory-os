@@ -23,14 +23,23 @@ class TimeMemory:
         metadata: dict[str, Any] | None = None,
     ) -> int:
         payload = dict(metadata or {})
-        target_at = timestamp or payload.pop("target_at", None) or iso_now()
-        event_type = str(payload.get("event_type") or "scheduled_task")
-        payload.update({"target_at": target_at, "metadata": dict(metadata or {})})
+        memory_at = timestamp or str(payload.get("memory_at") or "") or iso_now()
+        memory_date = str(payload.get("memory_date") or memory_at[:10])
+        title = str(payload.get("title") or "")
+        payload.update(
+            {
+                "memory_at": memory_at,
+                "memory_date": memory_date,
+                "title": title,
+                "source": payload.get("source", "manual"),
+                "metadata": dict(metadata or {}),
+            }
+        )
         return self.events.add_event(
             f"time-{user_id}-{device_id}-{iso_now()}",
             user_id,
             device_id,
-            event_type,
+            "time_memory",
             payload,
             content=content,
             created_at=iso_now(),
@@ -40,16 +49,3 @@ class TimeMemory:
         """Compatibility no-op: time memories are already durable in SQLite."""
         del before
         return 0
-
-
-class DailyArchiveScheduler:
-    """Deprecated compatibility shim; no archive is needed for SQLite time memories."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        del args, kwargs
-
-    def start(self) -> None:
-        return None
-
-    def stop(self, timeout: float = 2.0) -> None:
-        del timeout
