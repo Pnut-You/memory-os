@@ -9,7 +9,6 @@ from collections import deque
 from typing import Any
 
 from memory import MemoryManager
-from memory.rules import is_repeat_action_request
 
 from .llm import DebugChatLLM
 
@@ -37,7 +36,7 @@ class MemoryDebugRouter:
                 context["recent_messages"][-10:],
                 context["rolling_summary"],
                 context["user_card"],
-                context.get("latest_action_sequence") if is_repeat_action_request(query) else None,
+                context.get("latest_action_sequence"),
             )
         except Exception as exc:
             logger.exception("chat.llm_failed request_id=%s user_id=%s device_id=%s", request_id, user_id, device_id)
@@ -69,7 +68,7 @@ class MemoryDebugRouter:
             "model": str(model_info.get("model", self.llm.model)),
         }
         if debug:
-            latest_action_sequence = context.get("latest_action_sequence") if is_repeat_action_request(query) else None
+            latest_action_sequence = context.get("latest_action_sequence")
             if hasattr(self.llm, "build_messages"):
                 prompt_messages = self.llm.build_messages(
                     query,
@@ -138,6 +137,7 @@ class MemoryDebugRouter:
         timings: dict[str, float],
     ) -> list[dict[str, Any]]:
         time_memory = persist_result.get("time_memory")
+        pending_event = persist_result.get("pending_event")
         action_event_id = persist_result.get("action_event_id")
         return [
             {
@@ -169,7 +169,7 @@ class MemoryDebugRouter:
             },
             {
                 "name": "long_term_memory",
-                "title_zh": "长期记忆",
+                "title_zh": "偏好记忆",
                 "status": "ok" if context.get("user_card") else "empty",
                 "data": context.get("user_card") or {},
             },
@@ -181,9 +181,9 @@ class MemoryDebugRouter:
             },
             {
                 "name": "time_memory_routing",
-                "title_zh": "时间记忆路由",
-                "status": "created" if time_memory else "skipped",
-                "data": time_memory or {"reason": "no time memory pattern matched"},
+                "title_zh": "文本记忆写入",
+                "status": "confirmed" if time_memory else ("pending" if pending_event else "skipped"),
+                "data": time_memory or pending_event or {"reason": "no automatic text memory write"},
             },
             {
                 "name": "action_event_routing",
@@ -260,6 +260,8 @@ class MemoryDebugRouter:
             events = self.manager.events.list_action_events(user_id, device_id, limit=100)
         elif event_type == "time_memory":
             events = self.manager.events.list_time_memories(user_id, device_id, limit=100)
+        elif event_type == "event_summary" or event_type is None:
+            events = self.manager.events.list_event_summaries(user_id, device_id, limit=100)
         else:
             events = self.manager.events.list_events(
                 user_id=user_id,
@@ -297,18 +299,39 @@ class MemoryDebugRouter:
         self,
         user_id: str,
         device_id: str,
-        content: str,
-        target_at: str,
+        summary: str,
+        memory_date: str,
+        memory_at: str,
+        title: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         event_id = self.manager.remember_at(
             user_id,
             device_id,
-            content,
-            target_at,
-            {"target_at": target_at, "source": "debug", **(metadata or {})},
+            summary,
+            memory_at,
+            {"memory_date": memory_date, "memory_at": memory_at, "title": title, "source": "debug", **(metadata or {})},
         )
         return {"event_id": event_id, "time_memories": self.manager.events.list_time_memories(user_id, device_id)}
+
+    def create_event_summary(
+        self,
+        user_id: str,
+        device_id: str,
+        summary: str,
+        event_at: str,
+        title: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        event_id = self.manager.events.add_event_summary(
+            user_id,
+            device_id,
+            summary,
+            event_at,
+            title,
+            {"source": "debug", **(metadata or {})},
+        )
+        return {"event_id": event_id, "events": self.manager.events.list_event_summaries(user_id, device_id)}
 
     def time_memories(self, user_id: str, device_id: str | None = None) -> dict[str, Any]:
         return {

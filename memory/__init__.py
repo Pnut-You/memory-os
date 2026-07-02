@@ -6,10 +6,9 @@ from .preferences import PreferenceExtractor
 from .redis_memory import ShortTermMemory
 from .sqlite_event import SQLiteEventStore
 from .summarizer import Summarizer
-from .time_memory import DailyArchiveScheduler, TimeMemory
+from .time_memory import TimeMemory
 
 __all__ = [
-    "DailyArchiveScheduler",
     "MemoryConfig",
     "MemoryManager",
     "PreferenceExtractor",

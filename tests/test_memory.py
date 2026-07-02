@@ -7,12 +7,14 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from memory import MemoryConfig, MemoryManager, ShortTermMemory
 from memory.migrate import migrate_jsonl
 from memory.preferences import PreferenceExtractionResult
 from memory.sqlite_event import LEGACY_USER_ID, SQLiteEventStore
 from ui.app import QueryRequest
+from ui.llm import DebugChatLLM
 from ui.router import MemoryDebugRouter
 
 
@@ -78,7 +80,7 @@ class FailingExtractor(FakeExtractor):
 
 
 class FakeLLM:
-    model = "glm-4-flash"
+    model = "qwen3.7-plus"
 
     def __init__(self) -> None:
         self.calls = []
@@ -290,21 +292,20 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_action_habit_schedules_preference_extraction_with_action_event(self):
+    def test_action_habit_text_does_not_schedule_without_preference_keyword(self):
         manager = self.make_manager()
         manager.preference_extractor = FakeExtractor()
         try:
-            manager.add_conversation_turn(
+            result = manager.add_conversation_turn(
                 "r-action-pref",
                 "user-001",
                 "dog-001",
                 "以后默认往前走然后坐下",
                 "好",
             )
-            self.assertEqual(manager.process_memory_jobs_once()["succeeded"], 1)
-            context = manager.preference_extractor.calls[0]["events"]
-            self.assertEqual(context["context_mode"], "summary_plus_recent_turns")
-            self.assertEqual(context["action_events"][-1]["event_type"], "action_sequence")
+            self.assertNotIn("action_event_id", result)
+            self.assertEqual(manager.events.list_jobs(job_type="preference_extraction"), [])
+            self.assertEqual(manager.events.list_action_events("user-001", "dog-001"), [])
         finally:
             manager.close()
 
@@ -451,7 +452,24 @@ class MemorySystemTests(unittest.TestCase):
     def test_summary_window_dislike_becomes_structured_preference(self):
         manager = self.make_manager()
         manager.summarizer = FixedSummarizer("用户不喜欢吃香菜，有独特的饮食偏好。")
-        manager.preference_extractor = FakeExtractor()
+        manager.preference_extractor = FakeExtractor(
+            {
+                "schema_version": "1.0",
+                "user_id": "user-001",
+                "preferences": [
+                    {
+                        "preference_key": "preference.dislikes",
+                        "category": "preference",
+                        "value": {"type": "string", "code": "香菜", "label_zh": "香菜"},
+                        "display_text_zh": "不喜欢香菜",
+                        "confidence": 0.95,
+                        "strength": 0.8,
+                        "polarity": "avoid",
+                        "evidence": [{"event_id": 1, "text": "我不喜欢吃香菜", "type": "explicit"}],
+                    }
+                ],
+            }
+        )
         try:
             manager.add_conversation_turn("r0", "user-001", "dog-001", "我不喜欢吃香菜", "记住了")
             for i in range(1, 10):
@@ -498,20 +516,17 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_preference_job_partially_succeeds_when_model_fails_after_local_rules(self):
+    def test_preference_job_fails_when_model_fails_without_local_rules(self):
         manager = self.make_manager()
         manager.preference_extractor = FailingExtractor()
         try:
             manager.add_conversation_turn("r1", "user-001", "dog-001", "我喜欢吃苹果", "好")
             result = manager.process_memory_jobs_once()
-            self.assertEqual(result["succeeded"], 1)
-            self.assertEqual(result["failed"], 0)
-            self.assertIn("model_error", result["jobs"][0])
+            self.assertEqual(result["succeeded"], 0)
+            self.assertEqual(result["failed"], 1)
+            self.assertIn("extractor down", result["errors"][0]["error"])
             prefs = manager.events.list_preferences("user-001", status="active")
-            labels = {item["display_text_zh"] for item in prefs}
-            self.assertIn("喜欢苹果", labels)
-            rebuild = manager.events.list_jobs(job_type="user_card_rebuild", limit=1)
-            self.assertEqual(rebuild[0]["status"], "pending")
+            self.assertEqual(prefs, [])
         finally:
             manager.close()
 
@@ -568,24 +583,54 @@ class MemorySystemTests(unittest.TestCase):
         self.assertEqual(single_result.user_id, "u")
         self.assertEqual(single_result.preferences[0].preference_key, "interaction.style")
 
-    def test_preference_extractor_config_falls_back_to_llm_config(self):
+    def test_config_prefers_dashscope_key_and_preference_reuses_it(self):
         root = Path(self.temp.name)
         env_path = root / ".env"
         env_path.write_text(
             "\n".join(
                 [
-                    "LLM_API_KEY=test-key",
-                    "LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4",
-                    "LLM_MODEL=glm-4-flash",
+                    "DASHSCOPE_API_KEY=sk-dashscope-key",
+                    "LLM_API_KEY=sk-llm-key",
+                    "LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "LLM_MODEL=qwen3.7-plus",
                 ]
             ),
             encoding="utf-8",
         )
-        config = MemoryConfig.from_env(env_path)
+        with patch.dict("os.environ", {}, clear=True):
+            config = MemoryConfig.from_env(env_path)
+        self.assertEqual(config.llm_api_key, "sk-dashscope-key")
+        self.assertEqual(config.llm_api_key_source, "DASHSCOPE_API_KEY")
         self.assertTrue(config.preference_extractor_enabled)
-        self.assertEqual(config.preference_extractor_api_key, "test-key")
-        self.assertEqual(config.preference_extractor_base_url, "https://open.bigmodel.cn/api/paas/v4")
-        self.assertEqual(config.preference_extractor_model, "glm-4-flash")
+        self.assertEqual(config.preference_extractor_api_key, "sk-dashscope-key")
+        self.assertEqual(config.preference_extractor_api_key_source, "DASHSCOPE_API_KEY")
+        self.assertEqual(config.preference_extractor_base_url, "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        self.assertEqual(config.preference_extractor_model, "qwen3.7-max")
+
+    def test_config_keeps_llm_api_key_as_compatibility_fallback(self):
+        root = Path(self.temp.name)
+        env_path = root / ".env"
+        env_path.write_text("LLM_API_KEY=sk-legacy-key\n", encoding="utf-8")
+        with patch.dict("os.environ", {}, clear=True):
+            config = MemoryConfig.from_env(env_path)
+        self.assertEqual(config.llm_api_key, "sk-legacy-key")
+        self.assertEqual(config.llm_api_key_source, "LLM_API_KEY")
+        self.assertEqual(config.preference_extractor_api_key, "sk-legacy-key")
+        self.assertEqual(config.preference_extractor_api_key_source, "LLM_API_KEY")
+
+    def test_debug_llm_status_and_invalid_dashscope_key_are_diagnostic(self):
+        llm = DebugChatLLM(
+            "2783-invalid",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "qwen3.7-plus",
+            "LLM_API_KEY",
+        )
+        status = llm.status()
+        self.assertEqual(status["api_key_source"], "LLM_API_KEY")
+        self.assertEqual(status["api_key_hint"]["prefix"], "2783")
+        self.assertEqual(status["api_key_hint"]["length"], len("2783-invalid"))
+        with self.assertRaisesRegex(RuntimeError, "LLM_API_KEY"):
+            llm.complete("你好", [], "", {})
 
     def test_same_preference_increments_evidence_count(self):
         manager = self.make_manager()
@@ -658,7 +703,7 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_rule_extraction_supplements_model_when_like_is_missing(self):
+    def test_model_extraction_does_not_get_local_rule_supplements(self):
         manager = self.make_manager()
         manager.preference_extractor = FakeExtractor(
             {
@@ -685,7 +730,7 @@ class MemorySystemTests(unittest.TestCase):
             active = manager.events.list_preferences("user-001", status="active", limit=10)
             labels = {item["display_text_zh"] for item in active}
             self.assertIn("喜欢旅游", labels)
-            self.assertIn("喜欢苹果", labels)
+            self.assertNotIn("喜欢苹果", labels)
         finally:
             manager.close()
 
@@ -1015,6 +1060,8 @@ class MemorySystemTests(unittest.TestCase):
     def test_ui_contains_device_realtime_state_page(self):
         html = Path("ui/static/index.html").read_text(encoding="utf-8")
         self.assertIn("设备实时状态", html)
+        self.assertIn("偏好记忆", html)
+        self.assertNotIn("长期记忆", html)
         self.assertIn("结构化偏好", html)
         self.assertIn("职业", html)
         self.assertIn("明确不喜欢", html)
@@ -1025,6 +1072,15 @@ class MemorySystemTests(unittest.TestCase):
         self.assertIn("run-preference-extract", html)
         self.assertIn("错误:", html)
         self.assertIn("模型警告:", html)
+        self.assertIn("日期总结", html)
+        self.assertIn("事件摘要库", html)
+        self.assertIn("摘要正文", html)
+        self.assertIn("add-event-summary", html)
+        self.assertNotIn("目标时间", html)
+        self.assertNotIn("时间任务列表", html)
+        self.assertNotIn("定时任务", html)
+        self.assertNotIn("条件任务", html)
+        self.assertNotIn("待补全事件", html)
         self.assertIn("await r.text()", html)
         self.assertIn('rel="icon"', html)
         self.assertIn("@media(max-width:1200px)", html)
@@ -1041,7 +1097,10 @@ class MemorySystemTests(unittest.TestCase):
             self.assertIn(field, html)
 
     def test_ui_favicon_route_does_not_404(self):
-        from fastapi.testclient import TestClient
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"fastapi test client unavailable: {exc}")
 
         from ui.app import app
 
@@ -1050,115 +1109,100 @@ class MemorySystemTests(unittest.TestCase):
         self.assertEqual(response.headers["content-type"], "image/svg+xml")
         self.assertIn("<svg", response.text)
 
-    def test_time_memory_keeps_target_at_separate_from_created_at(self):
+    def test_time_memory_is_daily_text_summary(self):
         manager = self.make_manager()
         try:
-            target_at = "2026-06-26T09:00:00+08:00"
+            memory_at = "2026-07-02T21:00:00+08:00"
             event_id = manager.remember_at(
                 "user-001",
                 "dog-001",
-                "明天早上九点给我放新闻",
-                target_at,
-                {"kind": "reminder"},
+                "今天完成了客厅巡检，并确认用户喜欢安静路线。",
+                memory_at,
+                {"memory_date": "2026-07-02", "title": "当天活动总结"},
             )
             memories = manager.events.list_time_memories("user-001", "dog-001")
             self.assertEqual(memories[0]["id"], event_id)
-            self.assertEqual(memories[0]["payload_json"]["target_at"], target_at)
-            self.assertNotEqual(memories[0]["created_at"], target_at)
-            self.assertEqual(memories[0]["content"], "明天早上九点给我放新闻")
+            self.assertEqual(memories[0]["event_type"], "time_memory")
+            self.assertEqual(memories[0]["payload_json"]["memory_at"], memory_at)
+            self.assertEqual(memories[0]["payload_json"]["memory_date"], "2026-07-02")
+            self.assertEqual(memories[0]["payload_json"]["title"], "当天活动总结")
+            self.assertEqual(memories[0]["content"], "今天完成了客厅巡检，并确认用户喜欢安静路线。")
         finally:
             manager.close()
 
-    def test_query_auto_routes_time_memory(self):
-        manager = self.make_manager()
-        try:
-            manager.add_conversation_turn(
-                "r-time",
-                "user-001",
-                "dog-001",
-                "明天早上九点给我播放新闻",
-                "好的",
-            )
-            memories = manager.events.list_time_memories("user-001", "dog-001")
-            self.assertEqual(len(memories), 1)
-            self.assertIn("T09:00:00", memories[0]["payload_json"]["target_at"])
-            self.assertIn("播放新闻", memories[0]["payload_json"]["task"])
-        finally:
-            manager.close()
-
-    def test_summary_window_time_memory_does_not_duplicate_existing(self):
-        manager = self.make_manager()
-        try:
-            manager.add_conversation_turn("r0", "user-001", "dog-001", "明天早上九点给我播放新闻", "好的")
-            for i in range(1, 10):
-                manager.add_conversation_turn(f"r{i}", "user-001", "dog-001", f"普通消息{i}", "好")
-            self.assertTrue(manager.wait_for_summaries())
-            memories = manager.events.list_time_memories("user-001", "dog-001")
-            self.assertEqual(len(memories), 1)
-        finally:
-            manager.close()
-
-    def test_query_auto_routes_wakeup_time_memory(self):
+    def test_plain_text_no_longer_creates_time_pending_or_action_event(self):
         manager = self.make_manager()
         try:
             result = manager.add_conversation_turn(
-                "r-wakeup",
+                "plain-route",
                 "user-001",
                 "dog-001",
-                "明天早上9点钟要叫我起床",
+                "明天早上九点提醒我喝水，然后坐下",
                 "好的",
             )
-            self.assertIn("time_memory", result)
-            memories = manager.events.list_time_memories("user-001", "dog-001")
-            self.assertEqual(len(memories), 1)
-            self.assertIn("T09:00:00", memories[0]["payload_json"]["target_at"])
-            self.assertNotIn("点钟", memories[0]["payload_json"]["task"])
-            self.assertIn("叫我起床", memories[0]["payload_json"]["task"])
-        finally:
-            manager.close()
-
-    def test_time_rules_cover_relative_weekly_and_cancel_update(self):
-        manager = self.make_manager()
-        try:
-            cases = [
-                ("后天晚上8点播放新闻", "scheduled_task"),
-                ("10分钟后提醒我喝水", "scheduled_task"),
-                ("半小时后叫我", "scheduled_task"),
-                ("每天早上7点叫我起床", "recurring_task"),
-                ("每周五晚上播放音乐", "recurring_task"),
-                ("下周一下午3点提醒我开会", "scheduled_task"),
-                ("取消明天的闹钟", "scheduled_task"),
-                ("把提醒改到8点半", "scheduled_task"),
-                ("推迟半小时", "scheduled_task"),
-            ]
-            for idx, (text, expected_type) in enumerate(cases):
-                manager.add_conversation_turn(f"time-{idx}", "user-001", "dog-001", text, "好的")
-                events = manager.events.list_time_memories("user-001", "dog-001", limit=50)
-                self.assertTrue(any(event["event_type"] == expected_type for event in events), text)
-        finally:
-            manager.close()
-
-    def test_incomplete_time_creates_pending_and_next_turn_completes(self):
-        manager = self.make_manager()
-        try:
-            first = manager.add_conversation_turn("pending-1", "user-001", "dog-001", "提醒我喝水", "什么时候提醒你？")
-            self.assertIn("event_route_id", first)
-            self.assertIsNotNone(manager.redis.get_value("pending-event", "dog-001:user-001"))
-            second = manager.add_conversation_turn("pending-2", "user-001", "dog-001", "10分钟后", "好的")
-            self.assertTrue(second["pending_event_completed"])
+            self.assertNotIn("pending_event", result)
             self.assertIsNone(manager.redis.get_value("pending-event", "dog-001:user-001"))
-            self.assertTrue(any(e["event_type"] == "scheduled_task" for e in manager.events.list_time_memories("user-001", "dog-001")))
+            self.assertEqual(manager.events.list_time_memories("user-001", "dog-001"), [])
+            self.assertEqual(manager.events.list_action_events("user-001", "dog-001"), [])
         finally:
             manager.close()
 
-    def test_conditional_task_is_not_written_as_time_memory(self):
+    def test_old_scheduled_tasks_are_not_returned_as_time_memories(self):
         manager = self.make_manager()
         try:
-            result = manager.add_conversation_turn("cond-1", "user-001", "dog-001", "电量低于20%提醒我充电", "好的")
-            self.assertIn("event_route_id", result)
-            events = manager.events.list_time_memories("user-001", "dog-001")
-            self.assertEqual(events[0]["event_type"], "conditional_task")
-            self.assertNotEqual(events[0]["event_type"], "scheduled_task")
+            manager.events.add_event(
+                "old-task",
+                "user-001",
+                "dog-001",
+                "scheduled_task",
+                {"target_at": "2026-07-02T09:00:00+08:00", "task": "喝水"},
+                content="喝水",
+            )
+            self.assertEqual(manager.events.list_time_memories("user-001", "dog-001"), [])
+        finally:
+            manager.close()
+
+    def test_model_scheduled_route_is_ignored_by_new_time_memory(self):
+        manager = self.make_manager()
+        try:
+            result = manager.add_conversation_turn(
+                "model-time-ignored",
+                "user-001",
+                "dog-001",
+                "随便聊聊",
+                "好的",
+                timestamp="2026-07-01T10:00:00+08:00",
+                model_event_routes=[
+                    {
+                        "type": "scheduled_task",
+                        "decision": "create",
+                        "confidence": 0.9,
+                        "task": "喝水",
+                        "target_at": "2026-07-02T09:00:00+08:00",
+                    }
+                ],
+            )
+            self.assertNotIn("pending_event", result)
+            self.assertIsNone(manager.redis.get_value("pending-event", "dog-001:user-001"))
+            self.assertEqual(manager.events.list_time_memories("user-001", "dog-001"), [])
+        finally:
+            manager.close()
+
+    def test_event_summary_is_separate_text_event(self):
+        manager = self.make_manager()
+        try:
+            event_id = manager.events.add_event_summary(
+                "user-001",
+                "dog-001",
+                "完成一次外出巡检，用户确认路线偏好。",
+                "2026-07-02T18:00:00+08:00",
+                "外出巡检",
+            )
+            events = manager.events.list_event_summaries("user-001", "dog-001")
+            self.assertEqual(events[0]["id"], event_id)
+            self.assertEqual(events[0]["event_type"], "event_summary")
+            self.assertEqual(events[0]["payload_json"]["event_at"], "2026-07-02T18:00:00+08:00")
+            self.assertEqual(events[0]["payload_json"]["title"], "外出巡检")
         finally:
             manager.close()
 
@@ -1173,9 +1217,46 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_model_event_route_candidate_only_records_actions(self):
+        manager = self.make_manager()
+        llm = RouteLLM(
+            "好的",
+            [
+                {
+                    "type": "action_sequence",
+                    "decision": "create",
+                    "confidence": 0.8,
+                    "actions": [{"code": "sit", "label_zh": "坐下"}],
+                    "missing_fields": [],
+                }
+            ],
+        )
+        router = MemoryDebugRouter(manager, llm)
+        try:
+            result = router.submit("user-001", "dog-001", "随便聊聊", debug=True)
+            self.assertEqual(result["assistant_reply"], "好的")
+            self.assertEqual(len(manager.events.list_action_events("user-001", "dog-001")), 1)
+            self.assertIsNone(manager.redis.get_value("pending-event", "dog-001:user-001"))
+        finally:
+            manager.close()
+
     def test_query_debug_trace_includes_time_memory_flow(self):
         manager = self.make_manager()
-        router = MemoryDebugRouter(manager, FakeLLM())
+        router = MemoryDebugRouter(
+            manager,
+            RouteLLM(
+                "好的",
+                [
+                    {
+                        "type": "scheduled_task",
+                        "decision": "create",
+                        "confidence": 0.9,
+                        "task": "叫我起床",
+                        "target_at": "2026-07-02T09:00:00+08:00",
+                    }
+                ],
+            ),
+        )
         try:
             result = router.submit("user-001", "dog-001", "明天早上9点钟要叫我起床", debug=True)
             steps = result["debug"]["trace_steps"]
@@ -1186,8 +1267,9 @@ class MemorySystemTests(unittest.TestCase):
             self.assertIn("time_memory_routing", names)
             self.assertIn("llm_prompt_messages", names)
             time_step = next(step for step in steps if step["name"] == "time_memory_routing")
-            self.assertEqual(time_step["status"], "created")
-            self.assertIn("T09:00:00", time_step["data"]["target_at"])
+            self.assertEqual(time_step["status"], "skipped")
+            self.assertEqual(time_step["title_zh"], "文本记忆写入")
+            self.assertEqual(time_step["data"]["reason"], "no automatic text memory write")
         finally:
             manager.close()
 
@@ -1199,7 +1281,7 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_action_sequence_enters_event_library_in_order(self):
+    def test_model_action_sequence_enters_event_library_in_order(self):
         manager = self.make_manager()
         try:
             manager.add_conversation_turn(
@@ -1208,6 +1290,19 @@ class MemorySystemTests(unittest.TestCase):
                 "dog-001",
                 "往前走往后走往左走然后坐下",
                 "好的",
+                model_event_routes=[
+                    {
+                        "type": "action_sequence",
+                        "decision": "create",
+                        "confidence": 0.9,
+                        "actions": [
+                            {"code": "forward", "label_zh": "往前走"},
+                            {"code": "backward", "label_zh": "往后走"},
+                            {"code": "left", "label_zh": "往左走"},
+                            {"code": "sit", "label_zh": "坐下"},
+                        ],
+                    }
+                ],
             )
             events = manager.events.list_action_events("user-001", "dog-001")
             self.assertEqual(
@@ -1217,61 +1312,26 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_single_action_uses_buffer_and_confirmation_preserves_it(self):
-        manager = self.make_manager()
-        try:
-            first = manager.add_conversation_turn("buf-1", "user-001", "dog-001", "坐下", "好的")
-            self.assertTrue(first["action_buffered"])
-            self.assertEqual(manager.events.list_action_events("user-001", "dog-001"), [])
-            manager.add_conversation_turn("buf-2", "user-001", "dog-001", "谢谢", "不客气")
-            buffered = manager.redis.get_value("action-buffer", "dog-001:user-001")
-            self.assertEqual([item["code"] for item in buffered["actions"]], ["sit"])
-        finally:
-            manager.close()
-
-    def test_repeat_action_prefers_current_buffer(self):
+    def test_latest_action_context_comes_from_model_created_events(self):
         manager = self.make_manager()
         llm = FakeLLM()
         router = MemoryDebugRouter(manager, llm)
         try:
-            router.submit("user-001", "dog-001", "坐下", debug=True)
-            router.submit("user-001", "dog-001", "重复刚才的动作", debug=True)
-            latest = llm.calls[-1]["latest_action_sequence"]
-            self.assertIsNotNone(latest)
-            self.assertEqual([item["code"] for item in latest["actions"]], ["sit"])
-        finally:
-            manager.close()
-
-    def test_summary_window_merges_multi_turn_actions(self):
-        manager = self.make_manager()
-        try:
-            manager.add_conversation_turn("r0", "user-001", "dog-001", "坐下", "好的")
-            manager.add_conversation_turn("r1", "user-001", "dog-001", "站起来", "好的")
-            manager.add_conversation_turn("r2", "user-001", "dog-001", "往前走", "好的")
-            for i in range(3, 10):
-                manager.add_conversation_turn(f"r{i}", "user-001", "dog-001", f"普通消息{i}", "好")
-            self.assertTrue(manager.wait_for_summaries())
-            events = manager.events.list_action_events("user-001", "dog-001", limit=20)
-            merged = [
-                event
-                for event in events
-                if (event.get("payload_json") or {}).get("parser") == "summary-window-rule-v1"
-            ]
-            self.assertTrue(merged)
-            self.assertEqual(
-                [item["code"] for item in merged[0]["payload_json"]["actions"]],
-                ["sit", "stand", "forward"],
+            manager.add_conversation_turn(
+                "ctx-action",
+                "user-001",
+                "dog-001",
+                "执行动作",
+                "好的",
+                model_event_routes=[
+                    {
+                        "type": "action_sequence",
+                        "decision": "create",
+                        "confidence": 0.9,
+                        "actions": [{"code": "sit", "label_zh": "坐下"}],
+                    }
+                ],
             )
-            self.assertEqual(merged[0]["payload_json"]["source_event_ids"], [1, 3, 5])
-        finally:
-            manager.close()
-
-    def test_repeat_action_request_passes_latest_action_context(self):
-        manager = self.make_manager()
-        llm = FakeLLM()
-        router = MemoryDebugRouter(manager, llm)
-        try:
-            router.submit("user-001", "dog-001", "往前走往后走往左走然后坐下", debug=True)
             router.submit("user-001", "dog-001", "重复上次操作", debug=True)
             latest = llm.calls[-1]["latest_action_sequence"]
             self.assertIsNotNone(latest)
@@ -1289,12 +1349,44 @@ class MemorySystemTests(unittest.TestCase):
         router = MemoryDebugRouter(manager, FakeLLM())
         try:
             router.submit("u", "d", "你好", debug=True)
-            router.create_time_memory("u", "d", "明天早上九点给我放新闻", "2026-06-26T09:00:00+08:00")
+            router.create_time_memory(
+                "u",
+                "d",
+                "当天完成巡检和偏好确认。",
+                "2026-07-02",
+                "2026-07-02T21:00:00+08:00",
+                "当天总结",
+            )
+            router.create_event_summary(
+                "u",
+                "d",
+                "完成一次外出巡检，用户确认路线偏好。",
+                "2026-07-02T18:00:00+08:00",
+                "外出巡检",
+            )
             router.update_debug_device_state("d", {"battery": 80}, "2026-06-25T10:00:00+08:00")
-            router.submit("u", "d", "往前走然后坐下", debug=True)
+            manager.add_conversation_turn(
+                "ui-action",
+                "u",
+                "d",
+                "往前走然后坐下",
+                "好的",
+                model_event_routes=[
+                    {
+                        "type": "action_sequence",
+                        "decision": "create",
+                        "confidence": 0.9,
+                        "actions": [
+                            {"code": "forward", "label_zh": "往前走"},
+                            {"code": "sit", "label_zh": "坐下"},
+                        ],
+                    }
+                ],
+            )
             self.assertIn("user_card", router.debug_user("u"))
             self.assertEqual(len(router.time_memories("u", "d")["time_memories"]), 1)
             self.assertEqual(len(router.action_events("u", "d")["actions"]), 1)
+            self.assertEqual(len(router.event_library("u", "d", "event_summary")["events"]), 1)
             self.assertTrue(router.event_library("u", "d", "action_sequence")["events"])
             self.assertIn("events", router.events("u", None, None))
             self.assertIn("state", router.debug_device("d"))

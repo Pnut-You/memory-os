@@ -228,7 +228,7 @@ class PreferenceExtractor:
                     "role": "system",
                     "content": (
                         "你是机器狗 Memory OS 的用户偏好抽取器。只输出严格 JSON，不要 Markdown。"
-                        "长期结构化记忆优先只写三类：profile.occupation、preference.likes、preference.dislikes。"
+                        "结构化偏好记忆优先只写三类：profile.occupation、preference.likes、preference.dislikes。"
                         "同时支持 habit.routine、constraint.stable、relationship.person、default_behavior.preference。"
                         "职业只从明确身份/职业表述抽取，例如我是摄影师、我的职业是产品经理。"
                         "喜欢用于明确稳定喜欢的事物，例如我喜欢摄影、我喜欢周杰伦。"
@@ -271,7 +271,7 @@ class PreferenceExtractor:
                                 "rules": [
                                     "顶层必须是对象，必须包含 schema_version、user_id、preferences。",
                                     "preferences 必须是数组；没有稳定偏好时返回空数组。",
-                                    "优先使用三类结构化长期记忆 key，不要把摄影、周杰伦等喜欢的事物写成 other。",
+                                    "优先使用三类结构化偏好记忆 key，不要把摄影、周杰伦等喜欢的事物写成 other。",
                                     "evidence 必须优先引用 preference_context.recent_turns、summary_evidence_events 或 action_events 中的真实 event_id。",
                                     "summary 可以提示应该抽取什么，但 evidence.text 要尽量使用 summary_evidence_events 里的用户原话。",
                                     "不要输出 Markdown，不要解释。",

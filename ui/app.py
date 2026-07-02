@@ -125,8 +125,19 @@ class DeviceStateRequest(BaseModel):
 
 class TimeMemoryRequest(BaseModel):
     device_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
-    content: str = Field(min_length=1, max_length=10_000)
-    target_at: str = Field(min_length=1, max_length=128)
+    summary: str = Field(min_length=1, max_length=10_000)
+    memory_date: str = Field(min_length=1, max_length=32)
+    memory_at: str = Field(min_length=1, max_length=128)
+    title: str = Field(default="", max_length=200)
+    metadata: dict[str, Any] = {}
+
+
+class EventSummaryRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    device_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    summary: str = Field(min_length=1, max_length=10_000)
+    event_at: str = Field(min_length=1, max_length=128)
+    title: str = Field(default="", max_length=200)
     metadata: dict[str, Any] = {}
 
 
@@ -150,7 +161,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         config = MemoryConfig.from_env()
         manager = MemoryManager.create(config, start_scheduler=True)
-        llm = DebugChatLLM(config.llm_api_key, config.llm_base_url, config.llm_model)
+        llm = DebugChatLLM(
+            config.llm_api_key,
+            config.llm_base_url,
+            config.llm_model,
+            config.llm_api_key_source,
+        )
         app.state.memory_manager = manager
         app.state.debug_router = MemoryDebugRouter(manager, llm)
         logger.debug(
@@ -264,6 +280,21 @@ def debug_event_library(
     return _router_or_503(request).event_library(user_id, device_id, event_type)
 
 
+@app.post("/api/debug/events/summaries")
+def create_debug_event_summary(
+    payload: EventSummaryRequest,
+    request: Request,
+) -> dict:
+    return _router_or_503(request).create_event_summary(
+        payload.user_id,
+        payload.device_id,
+        payload.summary.strip(),
+        payload.event_at.strip(),
+        payload.title.strip(),
+        payload.metadata,
+    )
+
+
 @app.get("/api/debug/users/{user_id}/actions")
 def debug_user_actions(
     request: Request,
@@ -291,8 +322,10 @@ def create_debug_time_memory(
     return _router_or_503(request).create_time_memory(
         user_id,
         payload.device_id,
-        payload.content.strip(),
-        payload.target_at.strip(),
+        payload.summary.strip(),
+        payload.memory_date.strip(),
+        payload.memory_at.strip(),
+        payload.title.strip(),
         payload.metadata,
     )
 

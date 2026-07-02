@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from .config import MemoryConfig
 from .preferences import (
@@ -21,7 +19,6 @@ from .preferences import (
     should_schedule_preference,
 )
 from .redis_memory import ShortTermMemory
-from .rules import is_confirmation, parse_action_sequence, parse_event_route, parse_time_memory
 from .sqlite_event import LEGACY_USER_ID, SQLiteEventStore
 from .summarizer import Summarizer
 from .time_memory import TimeMemory
@@ -145,8 +142,7 @@ class MemoryManager:
             recent = self.events.message_range(user_id, device_id, latest_summary_id, 20)[-10:]
             if recent:
                 self.redis.append_conversation(device_id, user_id, recent, max_items=20)
-        action_buffer = self.redis.get_value("action-buffer", f"{device_id}:{user_id}") or {}
-        latest_action = action_buffer if action_buffer.get("actions") else self.events.latest_action_sequence(user_id, device_id)
+        latest_action = self.events.latest_action_sequence(user_id, device_id)
         return {
             "user_id": user_id,
             "device_id": device_id,
@@ -156,7 +152,6 @@ class MemoryManager:
             "summary_pending": self._conversation_states.get((user_id, device_id), _ConversationState()).summary_pending,
             "recent_messages": recent[-10:],
             "latest_action_sequence": latest_action,
-            "action_buffer": action_buffer,
         }
 
     def add_conversation_turn(
@@ -178,12 +173,13 @@ class MemoryManager:
             {"id": assistant_event_id, "role": "assistant", "content": assistant_text, "timestamp": timestamp},
         ]
         self.redis.append_conversation(device_id, user_id, messages, max_items=self.summary_every_turns * 2)
-        routed = self._route_local_events(request_id, user_id, device_id, user_text, user_event_id)
-        if model_event_routes and not any(key in routed for key in ("time_memory_event_id", "event_route_id")):
-            model_routed = self._route_model_event_candidates(
-                request_id, user_id, device_id, user_text, user_event_id, model_event_routes
+        routed: dict[str, Any] = {}
+        if model_event_routes:
+            routed.update(
+                self._route_model_event_candidates(
+                    request_id, user_id, device_id, user_text, user_event_id, model_event_routes
+                )
             )
-            routed.update(model_routed)
         self._schedule_summary(user_id, device_id)
         if user_id != "anonymous":
             self._maybe_schedule_preference(
@@ -203,35 +199,46 @@ class MemoryManager:
         source_event_id: int,
         routes: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        accepted = []
+        accepted: list[dict[str, Any]] = []
         for route in routes:
             if not isinstance(route, dict):
                 continue
             confidence = float(route.get("confidence") or 0)
             event_type = str(route.get("type") or "")
             decision = str(route.get("decision") or "")
-            if confidence < 0.7 or event_type not in {"scheduled_task", "recurring_task", "conditional_task", "pending_event", "action_sequence"}:
+            if confidence < 0.7 or event_type != "action_sequence":
                 continue
-            if decision not in {"create", "clarify", "cancel", "update"}:
+            if decision != "create":
                 continue
             accepted.append({**route, "source": "reply_model_candidate", "source_event_id": source_event_id})
         if not accepted:
             return {}
-        event_id = self.events.add_event(
-            f"{request_id}-model-event-route",
-            user_id,
-            device_id,
-            "pending_event",
-            {"routes": accepted, "content": user_text},
-            content=user_text,
-        )
-        self.redis.set_value(
-            "pending-event",
-            f"{device_id}:{user_id}",
-            {"event_id": event_id, "routes": accepted, "content": user_text},
-            900,
-        )
-        return {"model_event_route_id": event_id, "model_event_routes": accepted}
+        routed: dict[str, Any] = {"model_event_routes": accepted}
+        for route in accepted:
+            event_type = str(route.get("type") or "")
+            decision = str(route.get("decision") or "")
+            if event_type == "action_sequence" and decision == "create":
+                actions = route.get("actions")
+                if not isinstance(actions, list) or not actions:
+                    continue
+                event_id = self.events.add_event(
+                    f"{request_id}-action",
+                    user_id,
+                    device_id,
+                    "action_sequence",
+                    {
+                        "event_type": "action_sequence",
+                        "actions": actions[:10],
+                        "parser": "reply-model-candidate-v1",
+                        "source_event_id": source_event_id,
+                        "source_event_ids": [source_event_id],
+                        "model_route": route,
+                    },
+                    content=user_text,
+                )
+                routed["action_event_id"] = event_id
+                continue
+        return routed
 
     def wait_for_summaries(self, timeout: float = 10.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -582,200 +589,6 @@ class MemoryManager:
             **self.events.stats(),
         }
 
-    def _route_local_events(
-        self,
-        request_id: str,
-        user_id: str,
-        device_id: str,
-        user_text: str,
-        source_event_id: int,
-    ) -> dict[str, Any]:
-        routed: dict[str, Any] = {}
-        completed = self._complete_pending_event(request_id, user_id, device_id, user_text, source_event_id)
-        if completed:
-            routed.update(completed)
-            return routed
-        event_route = parse_event_route(user_text)
-        if event_route:
-            routed["event_route"] = event_route
-            if event_route["decision"] == "create" and event_route["type"] in {"scheduled_task", "recurring_task"}:
-                event_id = self.time_memory.remember(
-                    user_id,
-                    device_id,
-                    user_text,
-                    event_route["target_at"],
-                    {
-                        "task": event_route["task"],
-                        "source_event_id": source_event_id,
-                        "parser": event_route["parser"],
-                        "event_type": event_route["type"],
-                        "recurrence": event_route.get("recurrence"),
-                    },
-                )
-                routed["time_memory_event_id"] = event_id
-                routed["time_memory"] = {
-                    "event_id": event_id,
-                    "target_at": event_route["target_at"],
-                    "task": event_route["task"],
-                    "parser": event_route["parser"],
-                    "type": event_route["type"],
-                    "recurrence": event_route.get("recurrence"),
-                }
-            elif event_route["type"] in {"conditional_task", "pending_event"} or event_route["decision"] in {"cancel", "update", "clarify"}:
-                event_id = self.events.add_event(
-                    f"{request_id}-{event_route['type']}",
-                    user_id,
-                    device_id,
-                    event_route["type"],
-                    {**event_route, "source_event_id": source_event_id},
-                    content=user_text,
-                )
-                routed["event_route_id"] = event_id
-                if event_route["type"] == "pending_event" or event_route["decision"] == "clarify":
-                    self.redis.set_value(
-                        "pending-event",
-                        f"{device_id}:{user_id}",
-                        {"event_id": event_id, **event_route, "content": user_text},
-                        900,
-                    )
-        action = parse_action_sequence(user_text)
-        if action and len(action.get("actions", [])) == 1:
-            self._append_action_buffer(user_id, device_id, source_event_id, user_text, action)
-            routed["action_buffered"] = True
-            routed["action_buffer"] = self.redis.get_value("action-buffer", f"{device_id}:{user_id}")
-        elif action:
-            event_id = self.events.add_event(
-                f"{request_id}-action",
-                user_id,
-                device_id,
-                "action_sequence",
-                {
-                    **action,
-                    "source_event_id": source_event_id,
-                },
-                content=user_text,
-            )
-            routed["action_event_id"] = event_id
-            self.redis.set_value(
-                "action-buffer",
-                f"{device_id}:{user_id}",
-                {
-                    "event_type": "action_sequence",
-                    "actions": action.get("actions", []),
-                    "source_event_ids": [source_event_id],
-                    "updated_at": iso_now(),
-                },
-                900,
-            )
-        elif is_confirmation(user_text):
-            routed["action_buffer_preserved"] = bool(self.redis.get_value("action-buffer", f"{device_id}:{user_id}"))
-        return routed
-
-    def _complete_pending_event(
-        self,
-        request_id: str,
-        user_id: str,
-        device_id: str,
-        user_text: str,
-        source_event_id: int,
-    ) -> dict[str, Any]:
-        pending = self.redis.get_value("pending-event", f"{device_id}:{user_id}")
-        if not pending:
-            return {}
-        target_at = self._parse_pending_time(user_text)
-        if not target_at:
-            return {}
-        task = str(pending.get("task") or pending.get("content") or user_text)
-        event_id = self.time_memory.remember(
-            user_id,
-            device_id,
-            task,
-            target_at,
-            {
-                "task": task,
-                "source_event_id": source_event_id,
-                "completed_pending_event_id": pending.get("event_id"),
-                "parser": "pending-event-rule-v1",
-                "event_type": "scheduled_task",
-            },
-        )
-        self.redis.delete_value("pending-event", f"{device_id}:{user_id}")
-        self.events.add_event(
-            f"{request_id}-pending-event-completed",
-            user_id,
-            device_id,
-            "pending_event",
-            {
-                "decision": "completed",
-                "source_event_id": source_event_id,
-                "completed_event_id": event_id,
-                "target_at": target_at,
-                "task": task,
-            },
-            content=user_text,
-        )
-        return {
-            "time_memory_event_id": event_id,
-            "time_memory": {
-                "event_id": event_id,
-                "target_at": target_at,
-                "task": task,
-                "parser": "pending-event-rule-v1",
-                "type": "scheduled_task",
-            },
-            "pending_event_completed": True,
-        }
-
-    @staticmethod
-    def _parse_pending_time(text: str) -> str | None:
-        tz = ZoneInfo("Asia/Shanghai")
-        now = datetime.now(tz)
-        relative = re.search(r"(\d+|半)\s*(分钟|小时|个小时)后", text)
-        if relative:
-            amount = 0.5 if relative.group(1) == "半" else int(relative.group(1))
-            delta = timedelta(hours=amount) if "小时" in relative.group(2) else timedelta(minutes=amount)
-            return (now + delta).replace(microsecond=0).isoformat()
-        match = re.search(r"([0-2]?\d)\s*[点:时](半)?", text)
-        if not match:
-            return None
-        hour = int(match.group(1))
-        minute = 30 if match.group(2) or "半" in text else 0
-        if any(word in text for word in ("下午", "晚上", "傍晚")) and hour < 12:
-            hour += 12
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        return target.isoformat()
-
-    def _append_action_buffer(
-        self,
-        user_id: str,
-        device_id: str,
-        source_event_id: int,
-        text: str,
-        action: dict[str, Any],
-    ) -> None:
-        key = f"{device_id}:{user_id}"
-        current = self.redis.get_value("action-buffer", key) or {"event_type": "action_sequence", "actions": [], "source_event_ids": [], "texts": []}
-        actions = list(current.get("actions") or [])
-        actions.extend(action.get("actions") or [])
-        source_ids = list(current.get("source_event_ids") or [])
-        source_ids.append(source_event_id)
-        texts = list(current.get("texts") or [])
-        texts.append(text)
-        self.redis.set_value(
-            "action-buffer",
-            key,
-            {
-                "event_type": "action_sequence",
-                "actions": actions[-10:],
-                "source_event_ids": source_ids[-10:],
-                "texts": texts[-10:],
-                "updated_at": iso_now(),
-            },
-            900,
-        )
-
     def close(self) -> None:
         self._job_stop.set()
         if self._job_thread:
@@ -801,9 +614,6 @@ class MemoryManager:
         latest_job_to = self.events.latest_preference_extraction_event_id(user_id)
         # Duplicate pending jobs are collapsed by a unique partial index.
         should = should_schedule_preference(user_text)
-        action = parse_action_sequence(user_text)
-        if action and any(word in user_text for word in ("以后", "默认", "每次", "总是", "习惯", "记住")):
-            should = True
         if not should:
             should = self.events.count_user_messages_since(user_id, latest_job_to) >= self.preference_extract_min_new_user_messages
         if should:
@@ -897,7 +707,6 @@ class MemoryManager:
                     from_event_id=max(0, from_event_id - 1),
                     to_event_id=compacted_through,
                 )
-            self._route_summary_window_events(user_id, device_id, summary_turns)
         finally:
             with self._lock:
                 state = self._conversation_states.setdefault(key, _ConversationState())
@@ -939,47 +748,7 @@ class MemoryManager:
         changed = False
         upserted = 0
         seen_preference_keys: set[tuple[str, str]] = set()
-        for pref in self._rule_based_preference_candidates(user_id, preference_context):
-            key = str(pref["preference_key"])
-            marker = (
-                key,
-                self.events.normalized_preference_value_key(
-                    key,
-                    pref["value"],
-                    str(pref["display_text_zh"]),
-                ),
-            )
-            if marker in seen_preference_keys:
-                continue
-            seen_preference_keys.add(marker)
-            pref_id = self.events.upsert_preference(
-                user_id,
-                pref["preference_key"],
-                pref["category"],
-                pref["value"],
-                pref["display_text_zh"],
-                pref["evidence"],
-                polarity=pref["polarity"],
-                durability="persistent",
-                strength=pref["strength"],
-                confidence=pref["confidence"],
-                source_type=pref["source_type"],
-                extractor_model="local-rule",
-                prompt_version="rule-v1",
-                reason_zh=pref["reason_zh"],
-                status=pref["status"],
-            )
-            changed = changed or pref_id is not None
-            if pref_id is not None:
-                upserted += 1
-        model_error: str | None = None
-        try:
-            result = self.preference_extractor.extract(user_id, preference_context, existing)
-        except Exception as exc:
-            if not upserted:
-                raise
-            result = None
-            model_error = str(exc)
+        result = self.preference_extractor.extract(user_id, preference_context, existing)
         model_preferences = list(result.preferences) if result else []
         model_preference_count = len(model_preferences)
         model_stored = 0
@@ -1043,81 +812,7 @@ class MemoryManager:
             "stored_preferences": upserted,
             "changed": changed,
         }
-        if model_error:
-            job_result["model_error"] = model_error
-            job_result["warning"] = "preference extractor failed; local explicit memory rules were saved"
         return job_result
-
-    def _route_summary_window_events(self, user_id: str, device_id: str, turns: list[dict[str, Any]]) -> None:
-        user_messages = [turn["user"] for turn in turns]
-        existing_time_sources = {
-            int(
-                (event.get("payload_json") or {}).get("source_event_id")
-                or (event.get("payload_json") or {}).get("metadata", {}).get("source_event_id")
-                or 0
-            )
-            for event in self.events.list_time_memories(user_id, device_id, limit=200)
-        }
-        for message in user_messages:
-            parsed = parse_time_memory(str(message.get("content") or ""))
-            source_id = int(message["id"])
-            if parsed and source_id not in existing_time_sources:
-                self.time_memory.remember(
-                    user_id,
-                    device_id,
-                    str(message.get("content") or ""),
-                    parsed["target_at"],
-                    {
-                        "task": parsed["task"],
-                        "source_event_id": source_id,
-                        "parser": parsed["parser"],
-                        "source": "summary_window",
-                    },
-                )
-                existing_time_sources.add(source_id)
-
-        existing_action_sources = {
-            tuple((event.get("payload_json") or {}).get("source_event_ids") or [])
-            for event in self.events.list_action_events(user_id, device_id, limit=200)
-        }
-        group: list[tuple[dict[str, Any], dict[str, Any]]] = []
-
-        def flush() -> None:
-            nonlocal group
-            if len(group) < 2:
-                group = []
-                return
-            source_ids = tuple(int(item[0]["id"]) for item in group)
-            if source_ids in existing_action_sources:
-                group = []
-                return
-            actions = []
-            for _, parsed_action in group:
-                actions.extend(parsed_action.get("actions", []))
-            self.events.add_event(
-                f"batch-action-{user_id}-{device_id}-{source_ids[0]}-{source_ids[-1]}",
-                user_id,
-                device_id,
-                "action_sequence",
-                {
-                    "actions": actions[:10],
-                    "parser": "summary-window-rule-v1",
-                    "source_event_ids": list(source_ids),
-                },
-                content=" / ".join(str(item[0].get("content") or "") for item in group),
-            )
-            existing_action_sources.add(source_ids)
-            group = []
-
-        for message in user_messages:
-            parsed_action = parse_action_sequence(str(message.get("content") or ""))
-            if parsed_action:
-                group.append((message, parsed_action))
-                if len(group) >= 10:
-                    flush()
-            else:
-                flush()
-        flush()
 
     def _build_preference_context(
         self,
@@ -1218,67 +913,6 @@ class MemoryManager:
             "existing_preference_count": context.get("existing_preference_count", 0),
         }
 
-    def _rule_based_preference_candidates(self, user_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-        del user_id
-        candidates: list[dict[str, Any]] = []
-        evidence_events = list(context.get("summary_evidence_events") or [])
-        for turn in context.get("recent_turns", []):
-            for message in turn.get("messages", []):
-                if message.get("role") == "user":
-                    evidence_events.append(
-                        {
-                            "event_id": message.get("event_id"),
-                            "text": message.get("text"),
-                            "created_at": message.get("created_at"),
-                            "event_type": "message",
-                        }
-                    )
-        seen: set[tuple[str, str]] = set()
-        for event in evidence_events:
-            text = str(event.get("text") or "")
-            event_id = int(event.get("event_id") or 0)
-            for key, pattern, polarity, label_prefix in (
-                ("preference.dislikes", r"(?:我)?(?:不喜欢|讨厌|不爱吃|不吃)([^，。,.；;、\s]{1,24})", "avoid", "不喜欢"),
-                ("preference.likes", r"(?<!不)(?<!没)(?:我)?(?:喜欢|爱|爱吃)([^，。,.；;、\s]{1,24})", "prefer", "喜欢"),
-                ("profile.occupation", r"(?:我是|我的职业是|我从事|我做)([^，。,.；;、\s]{1,24})", "prefer", "职业是"),
-            ):
-                for match in re.finditer(pattern, text):
-                    value = match.group(1).strip(" 的了呢啊呀")
-                    if value.startswith(("吃", "喝", "看", "听")) and len(value) > 1:
-                        value = value[1:]
-                    if not value:
-                        continue
-                    marker = (key, value)
-                    if marker in seen:
-                        continue
-                    seen.add(marker)
-                    category = "profile" if key == "profile.occupation" else "preference"
-                    confidence = 0.9 if event_id else 0.7
-                    candidates.append(
-                        {
-                            "preference_key": key,
-                            "category": category,
-                            "value": {"type": "string", "code": value, "label_zh": value},
-                            "display_text_zh": f"{label_prefix}{value}",
-                            "polarity": polarity,
-                            "strength": 0.75,
-                            "confidence": confidence,
-                            "source_type": "explicit" if event_id else "implicit",
-                            "evidence": [
-                                {
-                                    "event_id": event_id,
-                                    "text": text,
-                                    "type": "explicit" if event_id else "summary",
-                                    "confidence": confidence,
-                                }
-                            ]
-                            if event_id
-                            else [],
-                            "reason_zh": "本地规则从摘要证据窗口或最近对话中识别到明确长期记忆",
-                            "status": "active" if confidence >= 0.85 else "candidate",
-                        }
-                    )
-        return candidates
 
     def _build_user_card(self, user_id: str, preferences: list[dict[str, Any]]) -> dict[str, Any]:
         primary_order = {
