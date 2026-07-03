@@ -37,7 +37,7 @@ memory-os:device-state:{device_id}
 - `events`
   - 保存原始事实事件，包括用户消息、assistant 回复、日期总结、原始动作序列、每日动作记忆、迁移遗留事件等。
   - 核心字段：`request_id`、`user_id`、`device_id`、`session_id`、`event_type`、`role`、`content`、`payload_json`、`created_at`。
-  - `event_type='message'` 是对话原文；`time_memory` 是某一天做过事情的文本总结；`action_sequence` 是机器狗动作序列；`action_memory` 是按天从动作相关事件全量保留下来的文本动作记忆。旧 `action_chain_summary`、`event_summary`、`scheduled_task`、`recurring_task`、`conditional_task`、`pending_event` 只作为历史兼容数据保留，新请求不再写入。
+  - `event_type='message'` 是对话原文；`time_memory` 是某一天做过事情的文本总结；`action_sequence` 是机器狗动作序列；`action_memory` 是按天从动作相关事件全量保留下来的文本动作记忆；`action_preference_memory` 是最近 7 天重复出现至少两天的动作链偏好。旧 `event_memory`、`event_preference_memory`、`action_chain_summary`、`event_summary`、`scheduled_task`、`recurring_task`、`conditional_task`、`pending_event` 只作为历史兼容数据保留，新请求不再写入。
 
 - `conversation_sessions`
   - 保存内部自动切分的会话窗口。
@@ -120,27 +120,27 @@ SQLite 启用 WAL、外键和 busy timeout。旧数据库迁移前会备份 `dat
 
 `/api/query` 主链路只排队 `daily_time_memory_extract`，不等待摘要生成。后台 worker 从同一 `user_id + device_id + Asia/Shanghai 日期` 的所有 session 原始会话生成或覆盖当天唯一 `time_memory`。调试 UI 可以按日期重跑抽取，但不能手写摘要正文。
 
-### 动作记忆事件库
+### 事件记忆库
 
-事件库只展示机器狗动作域记忆。后台 `daily_action_memory_extract` 从同一天的结构化 `action_sequence` 和带动作引用的 `action_feedback` 全量生成 `action_memory`：
+事件库按日期展示机器狗行为事件记忆。后台 `daily_action_memory_extract` 从同一天的结构化 `action_sequence` 生成 `action_memory`，并把关联到该动作的 `action_feedback` 合并进同一条文本事件链路：
 
-- `content` 保存动作相关文本摘要。
+- `content` 保存事件链路文本，例如“事件记忆（2026-07-03）：事件链路：用户要求坐下 -> 机器狗完成坐下 -> 用户反馈：用户表示肯定”。
 - `payload_json.memory_date` 保存归属日期。
 - `payload_json.session_id` 保存来源会话。
 - `payload_json.actions` 保存动作顺序。
-- `payload_json.source_event_ids` 保存来源 `action_sequence` 或 `action_feedback` 事件。
+- `payload_json.source_event_ids` 保存来源 `action_sequence` 及其关联 `action_feedback` 事件。
 
-单次动作也会生成 `action_memory`，不会因为没有重复链路被丢弃。用户对动作 ID、动作事件 ID 或动作记忆 ID 的反馈会进入动作记忆；普通“喜欢/不喜欢/心情”等非机器狗动作内容不进入事件库。
+日期事件记忆只保留站起、坐下、转圈、跳舞、前进、后退等机器狗动态行为动作，以及用户对这些动作执行结果的反馈。提醒、出行计划、车票协助、安抚、心情和普通偏好不进入事件库。
 
-Agent 消费事件库时使用 text-only 接口 `GET /api/memories/events-text`。该接口只返回 `id`、`event_type`、`text`、`created_at`、`memory_date`、`session_id` 和 `device_id`，不暴露 `payload_json`；事件库 text 接口只接受 `action_memory`、`action_preference_memory` 和 `action_feedback` 动作域类型。
+Agent 消费事件库时使用 text-only 接口 `GET /api/memories/events-text`。该接口只返回 `id`、`event_type`、`text`、`created_at`、`memory_date`、`session_id` 和 `device_id`，不暴露 `payload_json`。
 
-### 七天动作偏好抽取
+### 七天事件偏好抽取
 
-事件库页的“七天动作偏好抽取”按钮调用 `weekly_action_preference_extract`。它读取结束日期往前 7 天的 `action_memory`，将这些动作记忆作为 `weekly_action_memory_preferences` 上下文交给抽取器，并把结果写成事件库自己的 `action_preference_memory` 文本事件；该入口不写入长期偏好表，也不在 `/api/query` 主链路同步执行。
+事件库页的“七天事件偏好抽取”按钮会同步读取结束日期往前 7 天的 `action_memory` 并执行抽取，方便调试页立即显示结果。同一事件链路在至少两天出现才写成 `action_preference_memory` 文本事件；该入口不写入长期偏好表，也不在 `/api/query` 主链路执行。
 
 ### 动作事件链路
 
-系统不再用本地动作词表解析用户原文。只有回复模型返回高置信度 `type='action_sequence'` 候选且包含 `actions` 数组时，系统才写入 `event_type='action_sequence'`；只有返回高置信度 `type='action_feedback'` 且包含动作引用时，系统才写入 `event_type='action_feedback'`。最近动作序列会作为普通上下文提供给回复模型，由模型自行判断是否用于“重复上次操作”等请求。
+系统不再用本地动作词表解析用户原文。只有回复模型返回高置信度 `type='action_sequence'` 候选且包含 `actions` 数组时，系统才写入 `event_type='action_sequence'`；回复模型返回高置信度 `type='action_feedback'` 时，系统优先使用模型提供的动作引用，没有引用则自动关联同一用户和设备下最近一次动作序列。没有可关联动作时，反馈不会写入事件库。最近动作序列会作为普通上下文提供给回复模型，由模型自行判断是否用于“重复上次操作”等请求。
 
 ### 偏好记忆链路
 
@@ -272,6 +272,7 @@ POST /api/debug/users/{user_id}/preferences/extract
 GET /api/debug/users/{user_id}/events
 GET /api/debug/users/{user_id}/time-memories
 POST /api/debug/users/{user_id}/time-memories
+POST /api/debug/users/{user_id}/events/extract
 GET /api/debug/events
 GET /api/memories/events-text
 GET /api/debug/users/{user_id}/actions
@@ -310,7 +311,7 @@ DELETE /api/debug/users/{user_id}/memory
 - 长期记忆：查看用户卡片、结构化偏好和证据；不展示会话列表或会话摘要。
 - 偏好记忆页的抽取诊断会显示事件范围、摘要版本、最近轮次数、动作数、偏好抽取上下文预览、最新成功处理事件和 worker 错误详情。
 - 日期总结：查看按天从会话历史自动抽取的文本摘要，也可按日期重跑抽取。
-- 动作记忆事件库：通过 text-only 接口分开查看“当天抽取的事件记忆”和“7 天偏好事件记忆”，也可手动触发每日动作抽取和七天动作偏好抽取。
+- 事件记忆库：通过 text-only 接口按日期查看“日期事件记忆”和“7 天事件偏好记忆”，也可手动触发日期事件抽取和七天事件偏好抽取。
 - 设备实时状态：查看在线状态、最新快照、历史记录，并用少量核心字段写入调试状态。
 
 ## 配置

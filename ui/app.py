@@ -128,6 +128,11 @@ class TimeMemoryRequest(BaseModel):
     memory_date: str = Field(min_length=1, max_length=32)
 
 
+class EventMemoryRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    memory_date: str = Field(min_length=1, max_length=32)
+
+
 class EventSummaryRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     device_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
@@ -290,6 +295,19 @@ def extract_debug_weekly_action_preferences(
         user_id,
         payload.device_id,
         payload.end_date.strip(),
+    )
+
+
+@app.post("/api/debug/users/{user_id}/events/extract")
+def extract_debug_daily_events(
+    payload: EventMemoryRequest,
+    request: Request,
+    user_id: str = FastAPIPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+) -> dict:
+    return _router_or_503(request).extract_daily_events(
+        user_id,
+        payload.device_id,
+        payload.memory_date.strip(),
     )
 
 

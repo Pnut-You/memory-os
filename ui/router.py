@@ -284,13 +284,7 @@ class MemoryDebugRouter:
             limit=500,
             ascending=True,
         )
-        action_memories = self.manager.events.list_action_memories(
-            user_id=user_id,
-            device_id=device_id,
-            session_id=session_id,
-            limit=200,
-        )
-        summary_text = self._session_summary_text(messages)
+        summary = self.manager.events.latest_summary(user_id, device_id)
         time_memories = [
             item
             for item in self.manager.events.list_time_memories(user_id, device_id, limit=100)
@@ -302,14 +296,8 @@ class MemoryDebugRouter:
             "session_id": session_id,
             "session": session,
             "messages": messages,
-            "action_memories": action_memories,
-            "summary": {
-                "session_id": session_id,
-                "device_id": device_id,
-                "summary_text": summary_text,
-                "message_count": len(messages),
-                "created_at": session.get("last_activity_at"),
-            } if summary_text else None,
+            "action_memories": [],
+            "summary": dict(summary) if summary else None,
             "time_memories": time_memories,
         }
 
@@ -339,6 +327,11 @@ class MemoryDebugRouter:
         event_type: str | None = None,
         session_id: str | None = None,
     ) -> dict[str, Any]:
+        aliases = {
+            "event_memory": "action_memory",
+            "event_preference_memory": "action_preference_memory",
+        }
+        event_type = aliases.get(event_type or "action_memory", event_type or "action_memory")
         allowed = {"action_memory", "action_preference_memory", "action_feedback"}
         if event_type not in allowed:
             event_type = "action_memory"
@@ -364,6 +357,11 @@ class MemoryDebugRouter:
         session_id: str | None = None,
         memory_date: str | None = None,
     ) -> dict[str, Any]:
+        aliases = {
+            "event_memory": "action_memory",
+            "event_preference_memory": "action_preference_memory",
+        }
+        event_type = aliases.get(event_type or "action_memory", event_type or "action_memory")
         if event_type not in {"action_memory", "action_preference_memory", "action_feedback"}:
             return {"memories": []}
         events = self.event_library(user_id, device_id, event_type, session_id)["events"]
@@ -410,6 +408,24 @@ class MemoryDebugRouter:
             **result,
             "time_memories": self.manager.events.list_time_memories(user_id, device_id),
             "action_memories": self.manager.events.list_action_memories(user_id=user_id, device_id=device_id),
+        }
+
+    def extract_daily_events(
+        self,
+        user_id: str,
+        device_id: str,
+        memory_date: str,
+    ) -> dict[str, Any]:
+        result = self.manager.trigger_daily_event_extraction(user_id, device_id, memory_date)
+        event_memories = self.manager.events.list_action_memories(
+            user_id=user_id,
+            device_id=device_id,
+            memory_date=memory_date,
+        )
+        return {
+            **result,
+            "ok": not bool((result.get("process") or {}).get("errors")),
+            "event_memories": [self._event_text(event) for event in event_memories],
         }
 
     def extract_weekly_action_preferences(
@@ -469,17 +485,6 @@ class MemoryDebugRouter:
             "session_id": event.get("session_id") or payload.get("session_id"),
             "device_id": event.get("device_id"),
         }
-
-    @staticmethod
-    def _session_summary_text(messages: list[dict[str, Any]]) -> str:
-        parts = [
-            f"{'用户' if item.get('role') == 'user' else '助手'}：{item.get('content')}"
-            for item in messages
-            if item.get("role") in {"user", "assistant"} and item.get("content")
-        ]
-        if not parts:
-            return ""
-        return "\n".join(parts)[:1600]
 
     def delete_user_memory(self, user_id: str) -> dict[str, Any]:
         return {"user_id": user_id, "deleted": self.manager.delete_user_memory(user_id)}

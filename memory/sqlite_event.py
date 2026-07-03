@@ -888,6 +888,57 @@ class SQLiteEventStore:
             self._conn.commit()
             return event_ids
 
+    def replace_daily_event_memories(
+        self,
+        user_id: str,
+        device_id: str,
+        memory_date: str,
+        memories: list[dict[str, Any]],
+    ) -> list[int]:
+        generated_at = iso_now()
+        with self._lock:
+            self._conn.execute(
+                """DELETE FROM events
+                WHERE user_id=? AND device_id=? AND event_type='event_memory'
+                    AND json_extract(payload_json,'$.memory_date')=?""",
+                (user_id, device_id, memory_date),
+            )
+            event_ids: list[int] = []
+            for idx, memory in enumerate(memories, start=1):
+                content = str(memory.get("content") or "").strip()
+                if not content:
+                    continue
+                payload = {
+                    "memory_date": memory_date,
+                    "event_at": memory.get("event_at") or generated_at,
+                    "title": memory.get("title") or f"{memory_date} 事件记忆 #{idx}",
+                    "source": memory.get("source") or "daily_time_memory_event_extraction",
+                    "source_event_ids": list(memory.get("source_event_ids") or []),
+                    "source_time_memory_id": memory.get("source_time_memory_id"),
+                    "event_key": memory.get("event_key"),
+                    "generated_at": generated_at,
+                    "metadata": dict(memory.get("metadata") or {}),
+                }
+                cursor = self._conn.execute(
+                    """INSERT INTO events
+                    (request_id,user_id,device_id,session_id,event_type,role,content,payload_json,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"event-memory-{user_id}-{device_id}-{memory_date}-{idx}",
+                        user_id,
+                        device_id,
+                        None,
+                        "event_memory",
+                        None,
+                        content,
+                        json.dumps(payload, ensure_ascii=False),
+                        generated_at,
+                    ),
+                )
+                event_ids.append(int(cursor.lastrowid))
+            self._conn.commit()
+            return event_ids
+
     def replace_weekly_action_preference_memories(
         self,
         user_id: str,
@@ -941,6 +992,61 @@ class SQLiteEventStore:
             self._conn.commit()
             return event_ids
 
+    def replace_weekly_event_preference_memories(
+        self,
+        user_id: str,
+        device_id: str,
+        start_date: str,
+        end_date: str,
+        memories: list[dict[str, Any]],
+    ) -> list[int]:
+        generated_at = iso_now()
+        with self._lock:
+            self._conn.execute(
+                """DELETE FROM events
+                WHERE user_id=? AND device_id=? AND event_type='event_preference_memory'
+                    AND json_extract(payload_json,'$.start_date')=?
+                    AND json_extract(payload_json,'$.end_date')=?""",
+                (user_id, device_id, start_date, end_date),
+            )
+            event_ids: list[int] = []
+            for idx, memory in enumerate(memories, start=1):
+                content = str(memory.get("content") or "").strip()
+                if not content:
+                    continue
+                payload = {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "memory_date": end_date,
+                    "title": memory.get("title") or f"{start_date} 至 {end_date} 事件偏好记忆 #{idx}",
+                    "source": "weekly_event_memory_repetition",
+                    "source_event_ids": list(memory.get("source_event_ids") or []),
+                    "event_key": memory.get("event_key"),
+                    "occurrence_count": int(memory.get("occurrence_count") or 0),
+                    "evidence_dates": list(memory.get("evidence_dates") or []),
+                    "generated_at": generated_at,
+                    "metadata": dict(memory.get("metadata") or {}),
+                }
+                cursor = self._conn.execute(
+                    """INSERT INTO events
+                    (request_id,user_id,device_id,session_id,event_type,role,content,payload_json,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"event-preference-memory-{user_id}-{device_id}-{start_date}-{end_date}-{idx}",
+                        user_id,
+                        device_id,
+                        None,
+                        "event_preference_memory",
+                        None,
+                        content,
+                        json.dumps(payload, ensure_ascii=False),
+                        generated_at,
+                    ),
+                )
+                event_ids.append(int(cursor.lastrowid))
+            self._conn.commit()
+            return event_ids
+
     def list_action_memories(
         self,
         user_id: str | None = None,
@@ -961,6 +1067,24 @@ class SQLiteEventStore:
             rows = [row for row in rows if (row.get("payload_json") or {}).get("memory_date") == memory_date]
         return rows
 
+    def list_event_memories(
+        self,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        memory_date: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        rows = self.list_events(
+            user_id=user_id,
+            device_id=device_id,
+            event_type="event_memory",
+            limit=limit,
+            ascending=False,
+        )
+        if memory_date:
+            rows = [row for row in rows if (row.get("payload_json") or {}).get("memory_date") == memory_date]
+        return rows
+
     def list_action_preference_memories(
         self,
         user_id: str | None = None,
@@ -972,6 +1096,24 @@ class SQLiteEventStore:
             user_id=user_id,
             device_id=device_id,
             event_type="action_preference_memory",
+            limit=limit,
+            ascending=False,
+        )
+        if end_date:
+            rows = [row for row in rows if (row.get("payload_json") or {}).get("end_date") == end_date]
+        return rows
+
+    def list_event_preference_memories(
+        self,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        end_date: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        rows = self.list_events(
+            user_id=user_id,
+            device_id=device_id,
+            event_type="event_preference_memory",
             limit=limit,
             ascending=False,
         )
