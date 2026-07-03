@@ -6,11 +6,12 @@ FastAPI + 原生 HTML/CSS/JavaScript 调试界面，不引入 React、Vue 或 No
 
 ## 页面
 
-- 对话测试：输入 `user_id`、`device_id`、`query`，显示回复、总耗时、模型耗时、用户卡片版本和摘要版本。
+- 对话测试：输入 `user_id`、`device_id`、`query`，显示回复、总耗时、模型耗时、当前 session、用户卡片版本和摘要版本。
 - 对话测试：输入 query 后按 Enter 发送，Shift+Enter 换行。
-- 偏好记忆：查看 Redis 用户卡片、active/candidate 结构化偏好、滚动摘要和证据详情。
-- 日期总结：查看和手动新增某一天做过事情的文本摘要。
-- 事件摘要库：查看和手动新增独立事件摘要，也可筛选动作事件、对话消息、日期总结等事件。
+- 短期记忆：按 `user_id + device_id + 日期` 查看 session 列表，点击 session 后查看会话摘要、会话消息和该 session 的动作记忆。
+- 长期记忆：查看 Redis 用户卡片、active/candidate 结构化偏好和证据详情，不展示 session 列表。
+- 日期总结：查看按天从会话历史自动抽取的文本摘要，也可按日期重跑抽取。
+- 事件记忆库：按日期查看机器狗事件链路记忆和 7 天重复事件链路偏好记忆，并可手动触发日期事件抽取和七天事件偏好抽取。
 - 设备实时状态：查看在线状态、最新快照、历史记录，并写入少量核心调试状态字段。
 
 ## API
@@ -19,13 +20,17 @@ FastAPI + 原生 HTML/CSS/JavaScript 调试界面，不引入 React、Vue 或 No
 POST /api/query
 GET /api/status
 GET /api/debug/users/{user_id}
+GET /api/debug/users/{user_id}/sessions
+GET /api/debug/users/{user_id}/sessions/{session_id}
 GET /api/debug/users/{user_id}/preferences
 POST /api/debug/users/{user_id}/preferences/extract
+POST /api/debug/users/{user_id}/actions/preferences/extract
+POST /api/debug/users/{user_id}/events/extract
 GET /api/debug/users/{user_id}/events
 GET /api/debug/users/{user_id}/time-memories
 POST /api/debug/users/{user_id}/time-memories
 GET /api/debug/events
-POST /api/debug/events/summaries
+GET /api/memories/events-text
 GET /api/debug/users/{user_id}/actions
 GET /api/debug/devices/{device_id}
 POST /api/debug/devices/{device_id}/state
@@ -54,9 +59,9 @@ REDIS_ALLOW_MEMORY_FALLBACK=true uv run uvicorn ui.app:app --reload --host 127.0
 
 ## 查看位置
 
-- 对话测试：发送后会显示“请求链路”，包括请求输入、上下文读取、滚动摘要、偏好记忆、最近对话、文本记忆写入、动作事件路由、SQLite 写入、回复模型输入和回复模型输出。
-- 滚动摘要：偏好记忆页的“滚动摘要”面板会显示版本、压缩事件范围和本次压缩轮数；默认 10 轮触发，压缩较早 5 轮并保留最近 5 轮原文。摘要正文会从 SQLite 最近最多 20 轮已压缩会话重写，并限制在约 1600 字符内，不会无限拼接旧摘要。摘要完成后会触发后台偏好抽取；日期总结不做历史补写。
-- 结构化偏好：偏好记忆页按“职业 / 喜欢 / 明确不喜欢”三类展示偏好记忆，其他旧 key 或 candidate 放在“其他 / 历史偏好”里；按钮默认 `force=true`，会重跑当前滚动摘要 + 摘要证据原话 + 最近 5 轮完整会话 + 最近动作事件，并显示事件范围、摘要版本、最近轮次数、输入事件数、claimed、succeeded、failed、recovered 和错误详情。后端返回纯文本错误时页面会直接显示错误文本，不再显示 JSON parse 报错。
-- 日期总结：日期总结页保存 `event_type='time_memory'` 的文本摘要，`content` 是当天做过事情的总结，`payload_json.memory_date` 是归属日期，`payload_json.memory_at` 是带时区时间戳；页面可手动新增，不再展示 `target_at` 或定时任务字段。
-- 事件库：事件库页默认显示 `event_summary` 文本事件摘要，也可以筛选 `time_memory`、`message` 或 `action_sequence`。动作事件只来自回复模型返回的高置信度 `action_sequence` 候选；时间/条件任务候选不会从 `/api/query` 自动写入。
+- 对话测试：发送后会显示“请求链路”，包括请求输入、上下文读取、滚动摘要、偏好记忆、最近对话、短期记忆 / 当前 Session、日期总结抽取、动作事件路由、SQLite 写入、回复模型输入和回复模型输出。
+- 短期记忆：会话列表可点击；选中 session 后展示历史会话消息；会话摘要只显示达到滚动摘要条件后写入 SQLite 的真实摘要。
+- 结构化偏好：长期记忆页按“职业 / 喜欢 / 明确不喜欢”三类展示偏好记忆，其他旧 key 或 candidate 放在“其他 / 历史偏好”里；按钮默认 `force=true`，会重跑当前滚动摘要 + 摘要证据原话 + 最近 5 轮完整会话 + 最近动作事件，并显示事件范围、摘要版本、最近轮次数、输入事件数、claimed、succeeded、failed、recovered 和错误详情。后端返回纯文本错误时页面会直接显示错误文本，不再显示 JSON parse 报错。
+- 日期总结：日期总结页保存 `event_type='time_memory'` 的文本摘要，`content` 是当天做过事情的总结，`payload_json.memory_date` 是归属日期，`payload_json.memory_at` 是带时区时间戳；页面只允许按日期从当天会话重跑抽取，不提供手写摘要入口。
+- 事件库：事件库页调用 `/api/memories/events-text`，只显示 text 记忆，不展示 `payload_json`；按日期展示机器狗事件链路，链路内标注用户反馈；7 天列表显示重复出现至少两天的 `action_preference_memory`。
 - 设备状态：设备实时状态页可查询最新快照、历史记录，也可本地调试写入 `battery_percent`、`charging`、`network`、`location`、`motion_state`、`temperature_c`。

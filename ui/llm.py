@@ -104,6 +104,8 @@ class DebugChatLLM:
                     "{\"assistant_reply\":\"...\",\"event_routes\":[{\"type\":\"action_sequence\","
                     "\"decision\":\"create\",\"confidence\":0.0,"
                     "\"actions\":[{\"code\":\"动作代码\",\"label_zh\":\"中文动作\"}],\"missing_fields\":[]}]}"
+                    "如果用户是在评价最近一次机器狗动作执行效果，可返回 type 为 action_feedback 的事件，"
+                    "feedback 写用户原话或等价摘要。"
                     "；无法确定时直接返回普通中文回复。"
                 ),
             },

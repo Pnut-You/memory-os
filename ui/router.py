@@ -52,6 +52,7 @@ class MemoryDebugRouter:
                 query,
                 assistant_reply,
                 model_event_routes=model_info.get("event_routes") if isinstance(model_info.get("event_routes"), list) else None,
+                session_id=context.get("session_id"),
             )
         except Exception as exc:
             logger.exception("chat.persistence_failed request_id=%s user_id=%s device_id=%s", request_id, user_id, device_id)
@@ -93,6 +94,7 @@ class MemoryDebugRouter:
                 "total_ms": round(total_ms, 1),
                 "user_card_version": (context.get("user_card") or {}).get("version"),
                 "summary_version": context.get("summary_version", 0),
+                "session_id": context.get("session_id"),
                 "prompt_preview": self._prompt_preview(prompt_messages),
                 "prompt_messages": prompt_messages,
                 "trace_steps": self._trace_steps(
@@ -136,9 +138,9 @@ class MemoryDebugRouter:
         persist_result: dict[str, Any],
         timings: dict[str, float],
     ) -> list[dict[str, Any]]:
-        time_memory = persist_result.get("time_memory")
-        pending_event = persist_result.get("pending_event")
+        daily_extraction = persist_result.get("daily_extraction")
         action_event_id = persist_result.get("action_event_id")
+        action_feedback_event_id = persist_result.get("action_feedback_event_id")
         return [
             {
                 "name": "request_input",
@@ -152,6 +154,7 @@ class MemoryDebugRouter:
                 "status": "ok",
                 "duration_ms": timings["context_ms"],
                 "data": {
+                    "session_id": context.get("session_id"),
                     "recent_message_count": len(context.get("recent_messages") or []),
                     "summary_version": context.get("summary_version", 0),
                     "user_card_version": (context.get("user_card") or {}).get("version"),
@@ -180,16 +183,29 @@ class MemoryDebugRouter:
                 "data": context.get("recent_messages") or [],
             },
             {
-                "name": "time_memory_routing",
-                "title_zh": "文本记忆写入",
-                "status": "confirmed" if time_memory else ("pending" if pending_event else "skipped"),
-                "data": time_memory or pending_event or {"reason": "no automatic text memory write"},
+                "name": "short_term_session",
+                "title_zh": "短期记忆 / 当前 Session",
+                "status": "ok",
+                "data": {
+                    "session": context.get("session") or {},
+                    "recent_messages": context.get("recent_messages") or [],
+                    "rolling_summary": context.get("rolling_summary") or "",
+                },
+            },
+            {
+                "name": "daily_memory_extraction",
+                "title_zh": "日期总结抽取",
+                "status": "queued" if daily_extraction else "skipped",
+                "data": daily_extraction or {"reason": "daily extraction was not queued"},
             },
             {
                 "name": "action_event_routing",
                 "title_zh": "动作事件路由",
-                "status": "created" if action_event_id else "skipped",
-                "data": {"action_event_id": action_event_id} if action_event_id else {"reason": "no action sequence matched"},
+                "status": "created" if action_event_id or action_feedback_event_id else "skipped",
+                "data": {
+                    "action_event_id": action_event_id,
+                    "action_feedback_event_id": action_feedback_event_id,
+                } if action_event_id or action_feedback_event_id else {"reason": "no machine-dog action event matched"},
             },
             {
                 "name": "sqlite_persist",
@@ -225,10 +241,64 @@ class MemoryDebugRouter:
             "user_card": self.manager.get_user_card(user_id) or self.manager.restore_user_card(user_id),
             "active_preferences": self.manager.events.list_preferences(user_id, status="active", limit=100),
             "candidate_preferences": self.manager.events.list_preferences(user_id, status="candidate", limit=100),
-            "summaries": self.manager.events.list_summaries(user_id, limit=20),
-            "time_memories": self.manager.events.list_time_memories(user_id, limit=100),
-            "recent_messages": self.manager.events.list_events(user_id=user_id, event_type="message", limit=20),
             "evidence": self.manager.events.list_preference_evidence(user_id, limit=100),
+        }
+
+    def sessions(
+        self,
+        user_id: str,
+        device_id: str | None = None,
+        local_date: str | None = None,
+    ) -> dict[str, Any]:
+        sessions = self.manager.events.list_sessions(user_id, device_id, local_date, limit=100)
+        enriched = []
+        for session in sessions:
+            messages = self.manager.events.list_events(
+                user_id=user_id,
+                device_id=session.get("device_id"),
+                session_id=session.get("session_id"),
+                event_type="message",
+                limit=200,
+                ascending=True,
+            )
+            first_user = next((item for item in messages if item.get("role") == "user"), None)
+            enriched.append(
+                {
+                    **session,
+                    "message_count": len(messages),
+                    "preview": str((first_user or {}).get("content") or "")[:120],
+                }
+            )
+        return {"user_id": user_id, "device_id": device_id, "local_date": local_date, "sessions": enriched}
+
+    def session_detail(self, user_id: str, session_id: str) -> dict[str, Any]:
+        session = self.manager.events.get_session(session_id)
+        if not session or session.get("user_id") != user_id:
+            return {"user_id": user_id, "session_id": session_id, "session": None, "messages": [], "action_memories": [], "summary": None}
+        device_id = str(session["device_id"])
+        messages = self.manager.events.list_events(
+            user_id=user_id,
+            device_id=device_id,
+            session_id=session_id,
+            event_type="message",
+            limit=500,
+            ascending=True,
+        )
+        summary = self.manager.events.latest_summary(user_id, device_id)
+        time_memories = [
+            item
+            for item in self.manager.events.list_time_memories(user_id, device_id, limit=100)
+            if session_id in ((item.get("payload_json") or {}).get("metadata") or {}).get("session_ids", [])
+        ]
+        return {
+            "user_id": user_id,
+            "device_id": device_id,
+            "session_id": session_id,
+            "session": session,
+            "messages": messages,
+            "action_memories": [],
+            "summary": dict(summary) if summary else None,
+            "time_memories": time_memories,
         }
 
     def preferences(self, user_id: str) -> dict[str, Any]:
@@ -255,21 +325,53 @@ class MemoryDebugRouter:
         user_id: str | None = None,
         device_id: str | None = None,
         event_type: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        if event_type == "action_sequence":
-            events = self.manager.events.list_action_events(user_id, device_id, limit=100)
-        elif event_type == "time_memory":
-            events = self.manager.events.list_time_memories(user_id, device_id, limit=100)
-        elif event_type == "event_summary" or event_type is None:
-            events = self.manager.events.list_event_summaries(user_id, device_id, limit=100)
+        aliases = {
+            "event_memory": "action_memory",
+            "event_preference_memory": "action_preference_memory",
+        }
+        event_type = aliases.get(event_type or "action_memory", event_type or "action_memory")
+        allowed = {"action_memory", "action_preference_memory", "action_feedback"}
+        if event_type not in allowed:
+            event_type = "action_memory"
+        if event_type == "action_memory":
+            events = self.manager.events.list_action_memories(user_id=user_id, device_id=device_id, session_id=session_id, limit=100)
+        elif event_type == "action_preference_memory":
+            events = self.manager.events.list_action_preference_memories(user_id=user_id, device_id=device_id, limit=100)
         else:
             events = self.manager.events.list_events(
                 user_id=user_id,
                 device_id=device_id,
-                event_type=event_type or None,
+                session_id=session_id,
+                event_type="action_feedback",
                 limit=100,
             )
         return {"events": events}
+
+    def event_texts(
+        self,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        event_type: str | None = "action_memory",
+        session_id: str | None = None,
+        memory_date: str | None = None,
+    ) -> dict[str, Any]:
+        aliases = {
+            "event_memory": "action_memory",
+            "event_preference_memory": "action_preference_memory",
+        }
+        event_type = aliases.get(event_type or "action_memory", event_type or "action_memory")
+        if event_type not in {"action_memory", "action_preference_memory", "action_feedback"}:
+            return {"memories": []}
+        events = self.event_library(user_id, device_id, event_type, session_id)["events"]
+        rows = []
+        for event in events:
+            payload = event.get("payload_json") or {}
+            if memory_date and str(payload.get("memory_date") or "") != memory_date:
+                continue
+            rows.append(self._event_text(event))
+        return {"memories": rows}
 
     def action_events(self, user_id: str, device_id: str | None = None) -> dict[str, Any]:
         return {
@@ -295,24 +397,55 @@ class MemoryDebugRouter:
         result = self.manager.update_device_state(device_id, state, observed_at)
         return {"updated": result, **self.debug_device(device_id)}
 
-    def create_time_memory(
+    def extract_daily_memory(
         self,
         user_id: str,
         device_id: str,
-        summary: str,
         memory_date: str,
-        memory_at: str,
-        title: str = "",
-        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        event_id = self.manager.remember_at(
+        result = self.manager.trigger_daily_extraction(user_id, device_id, memory_date, process_now=True)
+        return {
+            **result,
+            "time_memories": self.manager.events.list_time_memories(user_id, device_id),
+            "action_memories": self.manager.events.list_action_memories(user_id=user_id, device_id=device_id),
+        }
+
+    def extract_daily_events(
+        self,
+        user_id: str,
+        device_id: str,
+        memory_date: str,
+    ) -> dict[str, Any]:
+        result = self.manager.trigger_daily_event_extraction(user_id, device_id, memory_date)
+        event_memories = self.manager.events.list_action_memories(
+            user_id=user_id,
+            device_id=device_id,
+            memory_date=memory_date,
+        )
+        return {
+            **result,
+            "ok": not bool((result.get("process") or {}).get("errors")),
+            "event_memories": [self._event_text(event) for event in event_memories],
+        }
+
+    def extract_weekly_action_preferences(
+        self,
+        user_id: str,
+        device_id: str,
+        end_date: str,
+    ) -> dict[str, Any]:
+        result = self.manager.trigger_weekly_action_preference_extraction(
             user_id,
             device_id,
-            summary,
-            memory_at,
-            {"memory_date": memory_date, "memory_at": memory_at, "title": title, "source": "debug", **(metadata or {})},
+            end_date,
+            process_now=True,
         )
-        return {"event_id": event_id, "time_memories": self.manager.events.list_time_memories(user_id, device_id)}
+        return {
+            **result,
+            "ok": not bool((result.get("process") or {}).get("errors")),
+            "action_preference_memories": self.manager.events.list_action_preference_memories(user_id, device_id, end_date=end_date),
+            "status": self.status(),
+        }
 
     def create_event_summary(
         self,
@@ -340,11 +473,24 @@ class MemoryDebugRouter:
             "time_memories": self.manager.events.list_time_memories(user_id, device_id),
         }
 
+    @staticmethod
+    def _event_text(event: dict[str, Any]) -> dict[str, Any]:
+        payload = event.get("payload_json") or {}
+        return {
+            "id": event.get("id"),
+            "event_type": event.get("event_type"),
+            "text": str(event.get("content") or ""),
+            "created_at": event.get("created_at"),
+            "memory_date": payload.get("memory_date"),
+            "session_id": event.get("session_id") or payload.get("session_id"),
+            "device_id": event.get("device_id"),
+        }
+
     def delete_user_memory(self, user_id: str) -> dict[str, Any]:
         return {"user_id": user_id, "deleted": self.manager.delete_user_memory(user_id)}
 
     def process_memory_jobs(self) -> dict[str, Any]:
-        process = self.manager.process_memory_jobs_once()
+        process = self.manager.process_memory_jobs_once(include_daily=True)
         return {"process": process, "status": self.status()}
 
     def extract_user_preferences(
