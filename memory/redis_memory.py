@@ -46,6 +46,12 @@ class ShortTermMemory:
     def conversation_key(self, device_id: str, user_id: str) -> str:
         return f"{self.prefix}:conversation:{device_id}:{user_id}"
 
+    def session_conversation_key(self, user_id: str, session_id: str) -> str:
+        return f"{self.prefix}:conversation:{user_id}:{session_id}"
+
+    def active_session_key(self, user_id: str, device_id: str) -> str:
+        return f"{self.prefix}:active-session:{user_id}:{device_id}"
+
     def summary_key(self, device_id: str, user_id: str) -> str:
         return f"{self.prefix}:summary:{device_id}:{user_id}"
 
@@ -88,8 +94,49 @@ class ShortTermMemory:
             self._memory[key] = self._memory[key][-max(1, max_items) :]
             self._expires[key] = time.time() + self.ttl_seconds
 
+    def append_session_conversation(
+        self,
+        user_id: str,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        ttl_seconds: int | None = None,
+        max_items: int = 20,
+    ) -> None:
+        key = self.session_conversation_key(user_id, session_id)
+        ttl = ttl_seconds or self.ttl_seconds
+        if self._redis is not None:
+            try:
+                pipe = self._redis.pipeline()
+                for message in messages:
+                    pipe.rpush(key, json.dumps(message, ensure_ascii=False))
+                pipe.ltrim(key, -max(1, max_items), -1)
+                pipe.expire(key, ttl)
+                pipe.execute()
+                return
+            except Exception as exc:
+                if not self.allow_memory_fallback:
+                    raise ConnectionError("Redis session conversation append failed") from exc
+                self._redis = None
+        with self._lock:
+            self._purge_expired(key)
+            self._memory[key].extend(dict(message) for message in messages)
+            self._memory[key] = self._memory[key][-max(1, max_items) :]
+            self._expires[key] = time.time() + ttl
+
     def get_conversation(self, device_id: str, user_id: str, limit: int | None = None) -> list[dict[str, Any]]:
         key = self.conversation_key(device_id, user_id)
+        return self._get_list(key, limit)
+
+    def get_session_conversation(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._get_list(self.session_conversation_key(user_id, session_id), limit)
+
+    def _get_list(self, key: str, limit: int | None = None) -> list[dict[str, Any]]:
         if self._redis is not None:
             try:
                 pipe = self._redis.pipeline()
@@ -108,6 +155,18 @@ class ShortTermMemory:
     def clear_conversation(self, device_id: str, user_id: str) -> None:
         self.delete_key(self.conversation_key(device_id, user_id))
         self.delete_key(self.summary_key(device_id, user_id))
+
+    def set_active_session(
+        self,
+        user_id: str,
+        device_id: str,
+        session: dict[str, Any],
+        ttl_seconds: int | None = None,
+    ) -> None:
+        self.set_json(self.active_session_key(user_id, device_id), session, ttl_seconds or self.ttl_seconds)
+
+    def get_active_session(self, user_id: str, device_id: str) -> dict[str, Any] | None:
+        return self.get_json(self.active_session_key(user_id, device_id))
 
     def get_context_bundle(self, device_id: str, user_id: str, recent_limit: int) -> dict[str, Any]:
         keys = [

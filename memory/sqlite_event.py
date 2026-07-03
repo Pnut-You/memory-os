@@ -8,9 +8,10 @@ import shutil
 import sqlite3
 import threading
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .utils import iso_now, tokenize, utc_now
 
@@ -40,7 +41,7 @@ class SQLiteEventStore:
         return list(self._migration_log)
 
     def _migrate_if_needed(self) -> None:
-        if not self._table_has_column("events", "session_id"):
+        if not self._table_has_column("events", "session_id") or self._table_has_column("events", "user_id"):
             return
         backup = self.path.with_name(f"{self.path.name}.bak-{iso_now().replace(':', '-')}")
         self._conn.commit()
@@ -99,6 +100,7 @@ class SQLiteEventStore:
                 request_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
                 device_id TEXT NOT NULL,
+                session_id TEXT,
                 event_type TEXT NOT NULL,
                 role TEXT,
                 content TEXT,
@@ -112,6 +114,18 @@ class SQLiteEventStore:
                 ON events(user_id, device_id, id);
             CREATE INDEX IF NOT EXISTS idx_events_filters
                 ON events(user_id, device_id, role, id);
+            CREATE TABLE IF NOT EXISTS conversation_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                local_date TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                last_activity_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active'
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user_device_date
+                ON conversation_sessions(user_id, device_id, local_date, last_activity_at);
 
             CREATE TABLE IF NOT EXISTS conversation_summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,7 +214,6 @@ class SQLiteEventStore:
                 last_error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                CHECK (job_type IN ('conversation_summary','preference_extraction','user_card_rebuild')),
                 CHECK (status IN ('pending','running','succeeded','failed'))
             );
             CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_preference_job
@@ -248,9 +261,90 @@ class SQLiteEventStore:
         self._conn.commit()
         self._ensure_column("user_preferences", "reason_zh", "TEXT")
         self._ensure_column("user_preferences", "scope", "TEXT NOT NULL DEFAULT 'user'")
+        self._ensure_column("events", "session_id", "TEXT")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_session ON events(user_id, session_id, id)"
+        )
+        self._conn.commit()
         self._ensure_column("conversation_summaries", "from_event_id", "INTEGER")
         self._ensure_column("conversation_summaries", "to_event_id", "INTEGER")
         self._ensure_column("conversation_summaries", "turn_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_memory_jobs_accepts_extraction_types()
+
+    def upsert_session(
+        self,
+        session_id: str,
+        user_id: str,
+        device_id: str,
+        local_date: str,
+        started_at: str,
+        last_activity_at: str,
+        expires_at: str,
+        status: str = "active",
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO conversation_sessions
+                (session_id,user_id,device_id,local_date,started_at,last_activity_at,expires_at,status)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    last_activity_at=excluded.last_activity_at,
+                    expires_at=excluded.expires_at,
+                    status=excluded.status""",
+                (session_id, user_id, device_id, local_date, started_at, last_activity_at, expires_at, status),
+            )
+            self._conn.commit()
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM conversation_sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_session(
+        self,
+        user_id: str,
+        device_id: str,
+        local_date: str | None = None,
+    ) -> dict[str, Any] | None:
+        params: list[Any] = [user_id, device_id]
+        where = "WHERE user_id=? AND device_id=?"
+        if local_date:
+            where += " AND local_date=?"
+            params.append(local_date)
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT * FROM conversation_sessions {where}
+                ORDER BY last_activity_at DESC LIMIT 1""",
+                params,
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_sessions(
+        self,
+        user_id: str,
+        device_id: str | None = None,
+        local_date: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = [user_id]
+        where = "WHERE user_id=?"
+        if device_id:
+            where += " AND device_id=?"
+            params.append(device_id)
+        if local_date:
+            where += " AND local_date=?"
+            params.append(local_date)
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT * FROM conversation_sessions {where}
+                ORDER BY last_activity_at DESC LIMIT ?""",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_message_pair(
         self,
@@ -261,30 +355,35 @@ class SQLiteEventStore:
         assistant_text: str,
         created_at: str | None = None,
         payload: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> tuple[int, int]:
         now = created_at or iso_now()
+        event_payload = dict(payload or {})
+        if session_id:
+            event_payload.setdefault("session_id", session_id)
         with self._lock:
             if self._conn.in_transaction:
                 self._conn.rollback()
             try:
                 user_cursor = self._conn.execute(
                     """INSERT INTO events
-                    (request_id,user_id,device_id,event_type,role,content,payload_json,created_at)
-                    VALUES(?,?,?,?,?,?,?,?)""",
-                    (request_id, user_id, device_id, "message", "user", user_text, self._json(payload or {}), now),
+                    (request_id,user_id,device_id,session_id,event_type,role,content,payload_json,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (request_id, user_id, device_id, session_id, "message", "user", user_text, self._json(event_payload), now),
                 )
                 assistant_cursor = self._conn.execute(
                     """INSERT INTO events
-                    (request_id,user_id,device_id,event_type,role,content,payload_json,created_at)
-                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (request_id,user_id,device_id,session_id,event_type,role,content,payload_json,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
                     (
                         request_id,
                         user_id,
                         device_id,
+                        session_id,
                         "message",
                         "assistant",
                         assistant_text,
-                        self._json(payload or {}),
+                        self._json(event_payload),
                         now,
                     ),
                 )
@@ -304,20 +403,25 @@ class SQLiteEventStore:
         role: str | None = None,
         content: str | None = None,
         created_at: str | None = None,
+        session_id: str | None = None,
     ) -> int:
+        event_payload = dict(payload or {})
+        if session_id:
+            event_payload.setdefault("session_id", session_id)
         with self._lock:
             cursor = self._conn.execute(
                 """INSERT INTO events
-                (request_id,user_id,device_id,event_type,role,content,payload_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?)""",
+                (request_id,user_id,device_id,session_id,event_type,role,content,payload_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
                 (
                     request_id,
                     user_id,
                     device_id,
+                    session_id,
                     event_type,
                     role,
                     content,
-                    self._json(payload or {}),
+                    self._json(event_payload),
                     created_at or iso_now(),
                 ),
             )
@@ -328,6 +432,7 @@ class SQLiteEventStore:
         self,
         user_id: str | None = None,
         device_id: str | None = None,
+        session_id: str | None = None,
         role: str | None = None,
         event_type: str | None = None,
         limit: int = 100,
@@ -341,6 +446,9 @@ class SQLiteEventStore:
         if device_id:
             clauses.append("device_id=?")
             params.append(device_id)
+        if session_id:
+            clauses.append("session_id=?")
+            params.append(session_id)
         if role:
             clauses.append("role=?")
             params.append(role)
@@ -355,6 +463,31 @@ class SQLiteEventStore:
                 f"SELECT * FROM events{where} ORDER BY id {order} LIMIT ?", params
             ).fetchall()
         return [self._decode_row(row, ("payload_json",)) for row in rows]
+
+    def get_event(self, event_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+        return self._decode_row(row, ("payload_json",)) if row else None
+
+    def list_events_for_local_date(
+        self,
+        user_id: str,
+        device_id: str,
+        memory_date: str,
+        *,
+        event_type: str | None = None,
+        session_id: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        rows = self.list_events(
+            user_id=user_id,
+            device_id=device_id,
+            session_id=session_id,
+            event_type=event_type,
+            limit=limit,
+            ascending=True,
+        )
+        return [row for row in rows if self._local_date(row.get("created_at")) == memory_date]
 
     def count_user_messages_since(self, user_id: str, after_event_id: int | None) -> int:
         clause = "user_id=? AND role='user'"
@@ -393,13 +526,19 @@ class SQLiteEventStore:
         device_id: str,
         after_event_id: int,
         limit: int,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        session_clause = " AND session_id=?" if session_id else ""
+        params: list[Any] = [user_id, device_id, after_event_id]
+        if session_id:
+            params.append(session_id)
+        params.append(limit)
         with self._lock:
             rows = self._conn.execute(
-                """SELECT * FROM events
-                WHERE user_id=? AND device_id=? AND event_type='message' AND id>?
+                f"""SELECT * FROM events
+                WHERE user_id=? AND device_id=? AND event_type='message' AND id>?{session_clause}
                 ORDER BY id ASC LIMIT ?""",
-                (user_id, device_id, after_event_id, limit),
+                params,
             ).fetchall()
         return [self._event_message(row) for row in rows]
 
@@ -409,12 +548,19 @@ class SQLiteEventStore:
         device_id: str,
         after_event_id: int,
         limit: int,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        session_clause = "AND u.session_id=?" if session_id else ""
+        params: list[Any] = [user_id, device_id, after_event_id]
+        if session_id:
+            params.append(session_id)
+        params.append(limit)
         with self._lock:
             rows = self._conn.execute(
-                """SELECT
+                f"""SELECT
                     u.id AS user_id_event,
                     u.request_id AS request_id,
+                    u.session_id AS session_id,
                     u.content AS user_content,
                     u.created_at AS user_created_at,
                     a.id AS assistant_id_event,
@@ -429,15 +575,17 @@ class SQLiteEventStore:
                     AND u.event_type='message'
                     AND u.role='user'
                     AND u.id>?
+                    {session_clause}
                 ORDER BY u.id ASC
                 LIMIT ?""",
-                (user_id, device_id, after_event_id, limit),
+                params,
             ).fetchall()
         turns = []
         for row in rows:
             turns.append(
                 {
                     "request_id": row["request_id"],
+                    "session_id": row["session_id"],
                     "user": {
                         "id": int(row["user_id_event"]),
                         "role": "user",
@@ -460,13 +608,20 @@ class SQLiteEventStore:
         device_id: str,
         through_event_id: int,
         limit: int,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        session_clause = "AND u.session_id=?" if session_id else ""
+        params: list[Any] = [user_id, device_id, through_event_id]
+        if session_id:
+            params.append(session_id)
+        params.append(limit)
         with self._lock:
             rows = self._conn.execute(
-                """SELECT * FROM (
+                f"""SELECT * FROM (
                     SELECT
                         u.id AS user_id_event,
                         u.request_id AS request_id,
+                        u.session_id AS session_id,
                         u.content AS user_content,
                         u.created_at AS user_created_at,
                         a.id AS assistant_id_event,
@@ -481,16 +636,18 @@ class SQLiteEventStore:
                         AND u.event_type='message'
                         AND u.role='user'
                         AND a.id<=?
+                        {session_clause}
                     ORDER BY u.id DESC
                     LIMIT ?
                 ) ORDER BY user_id_event ASC""",
-                (user_id, device_id, through_event_id, limit),
+                params,
             ).fetchall()
         turns = []
         for row in rows:
             turns.append(
                 {
                     "request_id": row["request_id"],
+                    "session_id": row["session_id"],
                     "user": {
                         "id": int(row["user_id_event"]),
                         "role": "user",
@@ -512,11 +669,12 @@ class SQLiteEventStore:
         user_id: str,
         device_id: str,
         limit: int,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         latest_id = self.latest_user_event_id(user_id, device_id) or 0
         if not latest_id:
             return []
-        return self.conversation_turns_until(user_id, device_id, latest_id + 1_000_000_000, limit)
+        return self.conversation_turns_until(user_id, device_id, latest_id + 1_000_000_000, limit, session_id=session_id)
 
     def latest_summary(self, user_id: str, device_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -622,10 +780,268 @@ class SQLiteEventStore:
     ) -> list[dict[str, Any]]:
         return self.list_events(user_id=user_id, device_id=device_id, event_type="event_summary", limit=limit)
 
+    def upsert_daily_time_memory(
+        self,
+        user_id: str,
+        device_id: str,
+        memory_date: str,
+        content: str,
+        *,
+        source_event_ids: list[int] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        generated_at = iso_now()
+        payload = {
+            "memory_date": memory_date,
+            "memory_at": generated_at,
+            "title": f"{memory_date} 日期总结",
+            "source": "daily_session_extraction",
+            "source_event_ids": list(source_event_ids or []),
+            "generated_at": generated_at,
+            "metadata": dict(metadata or {}),
+        }
+        with self._lock:
+            self._conn.execute(
+                """DELETE FROM events
+                WHERE user_id=? AND device_id=? AND event_type='time_memory'
+                    AND json_extract(payload_json,'$.memory_date')=?""",
+                (user_id, device_id, memory_date),
+            )
+            cursor = self._conn.execute(
+                """INSERT INTO events
+                (request_id,user_id,device_id,session_id,event_type,role,content,payload_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    f"daily-time-memory-{user_id}-{device_id}-{memory_date}",
+                    user_id,
+                    device_id,
+                    None,
+                    "time_memory",
+                    None,
+                    content,
+                    json.dumps(payload, ensure_ascii=False),
+                    generated_at,
+                ),
+            )
+            self._conn.commit()
+            return int(cursor.lastrowid)
+
+    def replace_daily_action_memories(
+        self,
+        user_id: str,
+        device_id: str,
+        memory_date: str,
+        memories: list[dict[str, Any]],
+    ) -> list[int]:
+        generated_at = iso_now()
+        with self._lock:
+            self._conn.execute(
+                """DELETE FROM events
+                WHERE user_id=? AND device_id=? AND event_type='action_memory'
+                    AND json_extract(payload_json,'$.memory_date')=?""",
+                (user_id, device_id, memory_date),
+            )
+            event_ids: list[int] = []
+            for idx, memory in enumerate(memories, start=1):
+                actions = memory.get("actions") if isinstance(memory.get("actions"), list) else []
+                content = str(memory.get("content") or memory.get("action_text") or "").strip()
+                if not content:
+                    labels = [
+                        str(action.get("label_zh") or action.get("code") or "").strip()
+                        for action in actions
+                        if isinstance(action, dict)
+                    ]
+                    content = " -> ".join(label for label in labels if label)
+                if not content:
+                    continue
+                session_id = memory.get("session_id")
+                payload = {
+                    "memory_date": memory_date,
+                    "event_at": memory.get("event_at") or generated_at,
+                    "title": memory.get("title") or f"{memory_date} 动作记忆 #{idx}",
+                    "source": memory.get("source") or "daily_action_memory_extraction",
+                    "session_id": session_id,
+                    "actions": actions,
+                    "source_event_ids": list(memory.get("source_event_ids") or []),
+                    "source_message_event_ids": list(memory.get("source_message_event_ids") or []),
+                    "confidence": float(memory.get("confidence") or 0.8),
+                    "generated_at": generated_at,
+                    "metadata": dict(memory.get("metadata") or {}),
+                }
+                cursor = self._conn.execute(
+                    """INSERT INTO events
+                    (request_id,user_id,device_id,session_id,event_type,role,content,payload_json,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"action-memory-{user_id}-{device_id}-{memory_date}-{idx}",
+                        user_id,
+                        device_id,
+                        str(session_id) if session_id else None,
+                        "action_memory",
+                        None,
+                        content,
+                        json.dumps(payload, ensure_ascii=False),
+                        generated_at,
+                    ),
+                )
+                event_ids.append(int(cursor.lastrowid))
+            self._conn.commit()
+            return event_ids
+
+    def replace_weekly_action_preference_memories(
+        self,
+        user_id: str,
+        device_id: str,
+        start_date: str,
+        end_date: str,
+        memories: list[dict[str, Any]],
+    ) -> list[int]:
+        generated_at = iso_now()
+        with self._lock:
+            self._conn.execute(
+                """DELETE FROM events
+                WHERE user_id=? AND device_id=? AND event_type='action_preference_memory'
+                    AND json_extract(payload_json,'$.start_date')=?
+                    AND json_extract(payload_json,'$.end_date')=?""",
+                (user_id, device_id, start_date, end_date),
+            )
+            event_ids: list[int] = []
+            for idx, memory in enumerate(memories, start=1):
+                content = str(memory.get("content") or "").strip()
+                if not content:
+                    continue
+                payload = {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "memory_date": end_date,
+                    "title": memory.get("title") or f"{start_date} 至 {end_date} 动作偏好记忆 #{idx}",
+                    "source": "weekly_action_preference_extraction",
+                    "source_event_ids": list(memory.get("source_event_ids") or []),
+                    "generated_at": generated_at,
+                    "confidence": float(memory.get("confidence") or 0.8),
+                    "metadata": dict(memory.get("metadata") or {}),
+                }
+                cursor = self._conn.execute(
+                    """INSERT INTO events
+                    (request_id,user_id,device_id,session_id,event_type,role,content,payload_json,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"action-preference-memory-{user_id}-{device_id}-{start_date}-{end_date}-{idx}",
+                        user_id,
+                        device_id,
+                        None,
+                        "action_preference_memory",
+                        None,
+                        content,
+                        json.dumps(payload, ensure_ascii=False),
+                        generated_at,
+                    ),
+                )
+                event_ids.append(int(cursor.lastrowid))
+            self._conn.commit()
+            return event_ids
+
+    def list_action_memories(
+        self,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        memory_date: str | None = None,
+        session_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        rows = self.list_events(
+            user_id=user_id,
+            device_id=device_id,
+            session_id=session_id,
+            event_type="action_memory",
+            limit=limit,
+            ascending=False,
+        )
+        if memory_date:
+            rows = [row for row in rows if (row.get("payload_json") or {}).get("memory_date") == memory_date]
+        return rows
+
+    def list_action_preference_memories(
+        self,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        end_date: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        rows = self.list_events(
+            user_id=user_id,
+            device_id=device_id,
+            event_type="action_preference_memory",
+            limit=limit,
+            ascending=False,
+        )
+        if end_date:
+            rows = [row for row in rows if (row.get("payload_json") or {}).get("end_date") == end_date]
+        return rows
+
+    def upsert_action_chain_summary(
+        self,
+        user_id: str,
+        device_id: str,
+        memory_date: str,
+        content: str,
+        *,
+        actions: list[dict[str, Any]],
+        frequency: int,
+        source_event_ids: list[int] | None = None,
+        source_message_event_ids: list[int] | None = None,
+    ) -> int:
+        generated_at = iso_now()
+        payload = {
+            "memory_date": memory_date,
+            "event_at": generated_at,
+            "title": f"{memory_date} 频繁动作链路",
+            "source": "daily_action_chain_extraction",
+            "actions": list(actions),
+            "frequency": int(frequency),
+            "source_event_ids": list(source_event_ids or []),
+            "source_message_event_ids": list(source_message_event_ids or []),
+            "generated_at": generated_at,
+        }
+        with self._lock:
+            self._conn.execute(
+                """DELETE FROM events
+                WHERE user_id=? AND device_id=? AND event_type='action_chain_summary'
+                    AND json_extract(payload_json,'$.memory_date')=?""",
+                (user_id, device_id, memory_date),
+            )
+            cursor = self._conn.execute(
+                """INSERT INTO events
+                (request_id,user_id,device_id,session_id,event_type,role,content,payload_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    f"action-chain-summary-{user_id}-{device_id}-{memory_date}",
+                    user_id,
+                    device_id,
+                    None,
+                    "action_chain_summary",
+                    None,
+                    content,
+                    json.dumps(payload, ensure_ascii=False),
+                    generated_at,
+                ),
+            )
+            self._conn.commit()
+            return int(cursor.lastrowid)
+
+    def list_action_chain_summaries(
+        self,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self.list_events(user_id=user_id, device_id=device_id, event_type="action_chain_summary", limit=limit)
+
     def list_action_events(
         self,
         user_id: str | None = None,
         device_id: str | None = None,
+        session_id: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         params: list[Any] = []
@@ -636,6 +1052,9 @@ class SQLiteEventStore:
         if device_id:
             where += " AND device_id=?"
             params.append(device_id)
+        if session_id:
+            where += " AND session_id=?"
+            params.append(session_id)
         params.append(limit)
         with self._lock:
             rows = self._conn.execute(
@@ -1016,6 +1435,45 @@ class SQLiteEventStore:
                     return None
                 raise
 
+    def upsert_pending_device_job(
+        self,
+        user_id: str,
+        device_id: str,
+        job_type: str,
+        from_event_id: int | None = None,
+        to_event_id: int | None = None,
+        available_at: str | None = None,
+    ) -> int | None:
+        now = iso_now()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT id,from_event_id,to_event_id FROM memory_jobs
+                WHERE user_id=? AND device_id=? AND job_type=? AND status IN ('pending','running')
+                ORDER BY id DESC LIMIT 1""",
+                (user_id, device_id, job_type),
+            ).fetchone()
+            if row:
+                job_id = int(row["id"])
+                prior_from = int(row["from_event_id"] or from_event_id or 0)
+                next_from = min(prior_from, int(from_event_id or prior_from or 0)) if prior_from else from_event_id
+                next_to = max(int(row["to_event_id"] or 0), int(to_event_id or 0)) or to_event_id
+                self._conn.execute(
+                    """UPDATE memory_jobs
+                    SET from_event_id=?, to_event_id=?, available_at=?, updated_at=?
+                    WHERE id=?""",
+                    (next_from, next_to, available_at or now, now, job_id),
+                )
+                self._conn.commit()
+                return None
+            return self.enqueue_job(
+                user_id,
+                job_type,
+                device_id=device_id,
+                from_event_id=from_event_id,
+                to_event_id=to_event_id,
+                available_at=available_at or now,
+            )
+
     def restart_preference_extraction_job(
         self,
         user_id: str,
@@ -1068,13 +1526,22 @@ class SQLiteEventStore:
             self._conn.commit()
             return int(cursor.rowcount)
 
-    def claim_jobs(self, limit: int, max_attempts: int | None = None) -> list[dict[str, Any]]:
+    def claim_jobs(
+        self,
+        limit: int,
+        max_attempts: int | None = None,
+        job_types: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         now = iso_now()
         params: list[Any] = [now]
         attempts_clause = ""
         if max_attempts is not None:
             attempts_clause = " AND attempts<?"
             params.append(max(1, max_attempts))
+        effective_job_types = job_types or {"conversation_summary", "preference_extraction", "user_card_rebuild"}
+        placeholders = ",".join("?" for _ in effective_job_types)
+        job_type_clause = f" AND job_type IN ({placeholders})"
+        params.extend(sorted(effective_job_types))
         params.append(limit)
         with self._lock:
             rows = self._conn.execute(
@@ -1083,6 +1550,7 @@ class SQLiteEventStore:
                     SELECT MIN(id) FROM memory_jobs
                     WHERE status IN ('pending','failed') AND available_at<=?
                     """ + attempts_clause + """
+                    """ + job_type_clause + """
                     AND NOT EXISTS (
                         SELECT 1 FROM memory_jobs active
                         WHERE active.user_id=memory_jobs.user_id
@@ -1126,10 +1594,21 @@ class SQLiteEventStore:
             self._conn.commit()
             return attempts
 
-    def job_counts(self) -> dict[str, int]:
+    def job_counts(self, include_daily: bool = False) -> dict[str, int]:
+        where = ""
+        params: list[Any] = []
+        if not include_daily:
+            where = "WHERE job_type NOT IN (?,?,?,?)"
+            params.extend([
+                "daily_time_memory_extract",
+                "action_chain_extract",
+                "daily_action_memory_extract",
+                "weekly_action_preference_extract",
+            ])
         with self._lock:
             rows = self._conn.execute(
-                "SELECT status,COUNT(*) AS count FROM memory_jobs GROUP BY status"
+                f"SELECT status,COUNT(*) AS count FROM memory_jobs {where} GROUP BY status",
+                params,
             ).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
 
@@ -1184,6 +1663,20 @@ class SQLiteEventStore:
                 (user_id,),
             )
             counts["event_summaries"] = cursor.rowcount
+            cursor = self._conn.execute(
+                """DELETE FROM events
+                WHERE user_id=? AND event_type='action_chain_summary'""",
+                (user_id,),
+            )
+            counts["action_chain_summaries"] = cursor.rowcount
+            cursor = self._conn.execute(
+                """DELETE FROM events
+                WHERE user_id=? AND event_type='action_memory'""",
+                (user_id,),
+            )
+            counts["action_memories"] = cursor.rowcount
+            cursor = self._conn.execute("DELETE FROM conversation_sessions WHERE user_id=?", (user_id,))
+            counts["conversation_sessions"] = cursor.rowcount
             cursor = self._conn.execute(
                 """DELETE FROM events
                 WHERE user_id=? AND event_type IN (
@@ -1313,6 +1806,67 @@ class SQLiteEventStore:
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
             self._conn.commit()
 
+    def _ensure_memory_jobs_accepts_extraction_types(self) -> None:
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_jobs'"
+        ).fetchone()
+        sql = str(row["sql"] if row else "")
+        if "job_type IN" not in sql:
+            return
+        with self._lock:
+            self._conn.execute("ALTER TABLE memory_jobs RENAME TO memory_jobs_old")
+            self._conn.execute(
+                """
+                CREATE TABLE memory_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    device_id TEXT,
+                    job_type TEXT NOT NULL,
+                    from_event_id INTEGER,
+                    to_event_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at TEXT NOT NULL,
+                    locked_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (status IN ('pending','running','succeeded','failed'))
+                )
+                """
+            )
+            self._conn.execute(
+                """INSERT INTO memory_jobs
+                (id,user_id,device_id,job_type,from_event_id,to_event_id,status,attempts,
+                 available_at,locked_at,last_error,created_at,updated_at)
+                SELECT id,user_id,device_id,job_type,from_event_id,to_event_id,status,attempts,
+                    available_at,locked_at,last_error,created_at,updated_at
+                FROM memory_jobs_old"""
+            )
+            self._conn.execute("DROP TABLE memory_jobs_old")
+            self._conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_preference_job
+                ON memory_jobs(user_id, job_type)
+                WHERE job_type='preference_extraction' AND status IN ('pending','running')"""
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_ready ON memory_jobs(status, available_at, id)"
+            )
+            self._conn.commit()
+
+    @staticmethod
+    def _local_date(value: Any, timezone_name: str = "Asia/Shanghai") -> str:
+        if not value:
+            return ""
+        text = str(value)
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return text[:10]
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        return parsed.astimezone(ZoneInfo(timezone_name)).date().isoformat()
+
     @staticmethod
     def _json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str)
@@ -1341,6 +1895,7 @@ class SQLiteEventStore:
             "role": row["role"],
             "content": row["content"],
             "timestamp": row["created_at"],
+            "session_id": row["session_id"],
         }
 
 

@@ -8,8 +8,9 @@ import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .config import MemoryConfig
 from .preferences import (
@@ -49,6 +50,8 @@ class MemoryManager:
         preference_extract_min_new_user_messages: int = 10,
         preference_extract_batch_size: int = 8,
         preference_extract_max_attempts: int = 3,
+        session_idle_seconds: int = 15,
+        session_ttl_seconds: int = 86400,
     ) -> None:
         self.redis = short_term
         self.events = events
@@ -65,6 +68,8 @@ class MemoryManager:
         self.preference_extract_min_new_user_messages = max(1, preference_extract_min_new_user_messages)
         self.preference_extract_batch_size = max(1, preference_extract_batch_size)
         self.preference_extract_max_attempts = max(1, preference_extract_max_attempts)
+        self.session_idle_seconds = max(1, session_idle_seconds)
+        self.session_ttl_seconds = max(60, session_ttl_seconds)
         self._conversation_states: dict[tuple[str, str], _ConversationState] = {}
         self._summary_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-summary")
         self._summary_futures: set[Future[Any]] = set()
@@ -117,6 +122,68 @@ class MemoryManager:
             manager.start_memory_worker()
         return manager
 
+    def resolve_session(
+        self,
+        user_id: str,
+        device_id: str,
+        *,
+        timestamp: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = timestamp or iso_now()
+        local_date = self._local_date(now)
+        expires_at = (self._parse_datetime(now) + timedelta(seconds=self.session_ttl_seconds)).isoformat()
+        if session_id:
+            existing = self.events.get_session(session_id)
+            if existing and existing.get("user_id") == user_id and existing.get("device_id") == device_id:
+                session = {**existing, "last_activity_at": now, "expires_at": expires_at, "status": "active"}
+                self.events.upsert_session(
+                    session_id,
+                    user_id,
+                    device_id,
+                    str(session.get("local_date") or local_date),
+                    str(session.get("started_at") or now),
+                    now,
+                    expires_at,
+                    "active",
+                )
+                self.redis.set_active_session(user_id, device_id, session, self.session_ttl_seconds)
+                return session
+        candidate = self.redis.get_active_session(user_id, device_id)
+        if not candidate:
+            candidate = self.events.latest_session(user_id, device_id, local_date)
+        if candidate:
+            last_activity = str(candidate.get("last_activity_at") or "")
+            same_day = str(candidate.get("local_date") or local_date) == local_date
+            gap_seconds = self._seconds_between(last_activity, now) if last_activity else self.session_idle_seconds + 1
+            if same_day and 0 <= gap_seconds <= self.session_idle_seconds:
+                session = {**candidate, "last_activity_at": now, "expires_at": expires_at, "status": "active"}
+                self.events.upsert_session(
+                    str(session["session_id"]),
+                    user_id,
+                    device_id,
+                    local_date,
+                    str(session.get("started_at") or now),
+                    now,
+                    expires_at,
+                    "active",
+                )
+                self.redis.set_active_session(user_id, device_id, session, self.session_ttl_seconds)
+                return session
+        new_session = {
+            "session_id": f"sess-{uuid.uuid4().hex}",
+            "user_id": user_id,
+            "device_id": device_id,
+            "local_date": local_date,
+            "started_at": now,
+            "last_activity_at": now,
+            "expires_at": expires_at,
+            "status": "active",
+        }
+        self.events.upsert_session(**new_session)
+        self.redis.set_active_session(user_id, device_id, new_session, self.session_ttl_seconds)
+        return new_session
+
     def start_memory_worker(self, poll_seconds: float = 2.0) -> None:
         if self._job_thread and self._job_thread.is_alive():
             return
@@ -125,27 +192,48 @@ class MemoryManager:
         def _loop() -> None:
             while not self._job_stop.wait(poll_seconds):
                 try:
-                    self.process_memory_jobs_once()
+                    self.process_memory_jobs_once(include_daily=True)
                 except Exception:
                     logger.exception("memory_job.worker_failed")
 
         self._job_thread = threading.Thread(target=_loop, name="memory-jobs", daemon=True)
         self._job_thread.start()
 
-    def get_conversation_context(self, user_id: str, device_id: str) -> dict[str, Any]:
+    def get_conversation_context(
+        self,
+        user_id: str,
+        device_id: str,
+        session_id: str | None = None,
+        timestamp: str | None = None,
+    ) -> dict[str, Any]:
+        session = self.resolve_session(user_id, device_id, timestamp=timestamp, session_id=session_id)
         bundle = self.redis.get_context_bundle(device_id, user_id, recent_limit=10)
         summary = bundle["summary"] or self._restore_summary(user_id, device_id)
         user_card = bundle["user_card"] or self.restore_user_card(user_id)
-        recent = bundle["recent_messages"]
+        recent = self.redis.get_session_conversation(user_id, session["session_id"], limit=10)
         if not recent:
             latest_summary_id = int((summary or {}).get("compacted_through_event_id", 0) or 0)
-            recent = self.events.message_range(user_id, device_id, latest_summary_id, 20)[-10:]
+            recent = self.events.message_range(
+                user_id,
+                device_id,
+                latest_summary_id,
+                20,
+                session_id=session["session_id"],
+            )[-10:]
             if recent:
-                self.redis.append_conversation(device_id, user_id, recent, max_items=20)
+                self.redis.append_session_conversation(
+                    user_id,
+                    session["session_id"],
+                    recent,
+                    ttl_seconds=self.session_ttl_seconds,
+                    max_items=20,
+                )
         latest_action = self.events.latest_action_sequence(user_id, device_id)
         return {
             "user_id": user_id,
             "device_id": device_id,
+            "session_id": session["session_id"],
+            "session": session,
             "user_card": user_card,
             "rolling_summary": (summary or {}).get("summary_text", ""),
             "summary_version": int((summary or {}).get("version", 0) or 0),
@@ -163,23 +251,46 @@ class MemoryManager:
         assistant_text: str,
         timestamp: str | None = None,
         model_event_routes: list[dict[str, Any]] | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         timestamp = timestamp or iso_now()
+        session = self.resolve_session(user_id, device_id, timestamp=timestamp, session_id=session_id)
         user_event_id, assistant_event_id = self.events.add_message_pair(
-            request_id, user_id, device_id, user_text, assistant_text, timestamp
+            request_id,
+            user_id,
+            device_id,
+            user_text,
+            assistant_text,
+            timestamp,
+            session_id=session["session_id"],
         )
         messages = [
-            {"id": user_event_id, "role": "user", "content": user_text, "timestamp": timestamp},
-            {"id": assistant_event_id, "role": "assistant", "content": assistant_text, "timestamp": timestamp},
+            {"id": user_event_id, "role": "user", "content": user_text, "timestamp": timestamp, "session_id": session["session_id"]},
+            {"id": assistant_event_id, "role": "assistant", "content": assistant_text, "timestamp": timestamp, "session_id": session["session_id"]},
         ]
-        self.redis.append_conversation(device_id, user_id, messages, max_items=self.summary_every_turns * 2)
+        self.redis.append_session_conversation(
+            user_id,
+            session["session_id"],
+            messages,
+            ttl_seconds=self.session_ttl_seconds,
+            max_items=self.summary_every_turns * 2,
+        )
         routed: dict[str, Any] = {}
         if model_event_routes:
             routed.update(
                 self._route_model_event_candidates(
-                    request_id, user_id, device_id, user_text, user_event_id, model_event_routes
+                    request_id,
+                    user_id,
+                    device_id,
+                    user_text,
+                    user_event_id,
+                    model_event_routes,
+                    timestamp,
+                    session["session_id"],
                 )
             )
+        memory_date = self._local_date(timestamp)
+        daily_jobs = self._schedule_daily_extraction(user_id, device_id, memory_date, user_event_id, assistant_event_id)
         self._schedule_summary(user_id, device_id)
         if user_id != "anonymous":
             self._maybe_schedule_preference(
@@ -188,7 +299,14 @@ class MemoryManager:
                 user_text,
                 int(routed.get("action_event_id") or user_event_id),
             )
-        return {"user_event_id": user_event_id, "assistant_event_id": assistant_event_id, **routed}
+        return {
+            "user_event_id": user_event_id,
+            "assistant_event_id": assistant_event_id,
+            "session_id": session["session_id"],
+            "session": session,
+            "daily_extraction": daily_jobs,
+            **routed,
+        }
 
     def _route_model_event_candidates(
         self,
@@ -198,6 +316,8 @@ class MemoryManager:
         user_text: str,
         source_event_id: int,
         routes: list[dict[str, Any]],
+        created_at: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         accepted: list[dict[str, Any]] = []
         for route in routes:
@@ -206,9 +326,11 @@ class MemoryManager:
             confidence = float(route.get("confidence") or 0)
             event_type = str(route.get("type") or "")
             decision = str(route.get("decision") or "")
-            if confidence < 0.7 or event_type != "action_sequence":
+            if confidence < 0.7 or event_type not in {"action_sequence", "action_feedback"}:
                 continue
             if decision != "create":
+                continue
+            if event_type == "action_feedback" and not self._has_action_reference(route):
                 continue
             accepted.append({**route, "source": "reply_model_candidate", "source_event_id": source_event_id})
         if not accepted:
@@ -235,10 +357,42 @@ class MemoryManager:
                         "model_route": route,
                     },
                     content=user_text,
+                    created_at=created_at,
+                    session_id=session_id,
                 )
                 routed["action_event_id"] = event_id
                 continue
+            if event_type == "action_feedback" and decision == "create":
+                feedback_text = str(route.get("feedback") or route.get("feedback_text") or user_text).strip()
+                if not feedback_text:
+                    continue
+                event_id = self.events.add_event(
+                    f"{request_id}-action-feedback",
+                    user_id,
+                    device_id,
+                    "action_feedback",
+                    {
+                        "event_type": "action_feedback",
+                        "feedback": feedback_text,
+                        "action_id": route.get("action_id"),
+                        "action_event_id": route.get("action_event_id"),
+                        "action_memory_id": route.get("action_memory_id"),
+                        "parser": "reply-model-candidate-v1",
+                        "source_event_id": source_event_id,
+                        "source_event_ids": [source_event_id],
+                        "model_route": route,
+                    },
+                    content=feedback_text,
+                    created_at=created_at,
+                    session_id=session_id,
+                )
+                routed["action_feedback_event_id"] = event_id
+                continue
         return routed
+
+    @staticmethod
+    def _has_action_reference(route: dict[str, Any]) -> bool:
+        return bool(route.get("action_id") or route.get("action_event_id") or route.get("action_memory_id"))
 
     def wait_for_summaries(self, timeout: float = 10.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -287,7 +441,7 @@ class MemoryManager:
             self.redis.delete_key(self.redis.user_card_key(user_id))
         return card
 
-    def process_memory_jobs_once(self, limit: int | None = None) -> dict[str, Any]:
+    def process_memory_jobs_once(self, limit: int | None = None, include_daily: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {
             "claimed": 0,
             "processed": 0,
@@ -300,6 +454,16 @@ class MemoryManager:
         jobs = self.events.claim_jobs(
             limit or self.preference_extract_batch_size,
             max_attempts=self.preference_extract_max_attempts,
+            job_types={
+                "conversation_summary",
+                "preference_extraction",
+                "user_card_rebuild",
+                "daily_time_memory_extract",
+                "daily_action_memory_extract",
+                "weekly_action_preference_extract",
+            }
+            if include_daily
+            else {"conversation_summary", "preference_extraction", "user_card_rebuild"},
         )
         result["claimed"] = len(jobs)
         for job in jobs:
@@ -311,6 +475,12 @@ class MemoryManager:
                     self.rebuild_user_card(str(job["user_id"]))
                 elif job["job_type"] == "conversation_summary":
                     self._run_summary(str(job["user_id"]), str(job["device_id"]))
+                elif job["job_type"] == "daily_time_memory_extract":
+                    job_result = self._process_daily_time_memory_job(job)
+                elif job["job_type"] == "daily_action_memory_extract":
+                    job_result = self._process_daily_action_memory_job(job)
+                elif job["job_type"] == "weekly_action_preference_extract":
+                    job_result = self._process_weekly_action_preference_job(job)
                 self.events.mark_job_succeeded(int(job["id"]))
                 result["processed"] += 1
                 result["succeeded"] += 1
@@ -334,6 +504,116 @@ class MemoryManager:
                     }
                 )
         return result
+
+    def trigger_daily_extraction(
+        self,
+        user_id: str,
+        device_id: str,
+        memory_date: str,
+        *,
+        process_now: bool = True,
+    ) -> dict[str, Any]:
+        events = self.events.list_events_for_local_date(
+            user_id,
+            device_id,
+            memory_date,
+            event_type="message",
+        )
+        action_events = self.events.list_events_for_local_date(
+            user_id,
+            device_id,
+            memory_date,
+            event_type="action_sequence",
+        )
+        feedback_events = self.events.list_events_for_local_date(
+            user_id,
+            device_id,
+            memory_date,
+            event_type="action_feedback",
+        )
+        selected_ids = [int(event["id"]) for event in events + action_events + feedback_events]
+        if not selected_ids:
+            return {
+                "user_id": user_id,
+                "device_id": device_id,
+                "memory_date": memory_date,
+                "created_jobs": [],
+                "message": "指定日期没有可抽取的会话或动作事件",
+                "process": self.process_memory_jobs_once(limit=1, include_daily=True) if process_now else None,
+            }
+        from_event_id = max(0, min(selected_ids) - 1)
+        to_event_id = max(selected_ids)
+        created_jobs = []
+        for job_type in ("daily_time_memory_extract", "daily_action_memory_extract"):
+            job_id = self.events.upsert_pending_device_job(
+                user_id,
+                device_id,
+                job_type,
+                from_event_id=from_event_id,
+                to_event_id=to_event_id,
+            )
+            created_jobs.append({"job_type": job_type, "job_id": job_id})
+        return {
+            "user_id": user_id,
+            "device_id": device_id,
+            "memory_date": memory_date,
+            "from_event_id": from_event_id,
+            "to_event_id": to_event_id,
+            "created_jobs": created_jobs,
+            "process": self.process_memory_jobs_once(limit=2, include_daily=True) if process_now else None,
+        }
+
+    def trigger_weekly_action_preference_extraction(
+        self,
+        user_id: str,
+        device_id: str,
+        end_date: str,
+        *,
+        process_now: bool = True,
+    ) -> dict[str, Any]:
+        if user_id in {"anonymous", LEGACY_USER_ID}:
+            return {
+                "user_id": user_id,
+                "device_id": device_id,
+                "end_date": end_date,
+                "created_job": False,
+                "message": "anonymous 和 legacy-unassigned 不生成长期偏好",
+                "process": self.process_memory_jobs_once(limit=1, include_daily=True) if process_now else None,
+            }
+        dates = self._date_window(end_date, 7)
+        memories = []
+        for date in dates:
+            memories.extend(self.events.list_action_memories(user_id, device_id, memory_date=date, limit=500))
+        if not memories:
+            return {
+                "user_id": user_id,
+                "device_id": device_id,
+                "end_date": end_date,
+                "dates": dates,
+                "created_job": False,
+                "message": "最近七天没有 action_memory 可用于偏好抽取",
+                "process": self.process_memory_jobs_once(limit=1, include_daily=True) if process_now else None,
+            }
+        ids = [int(item["id"]) for item in memories]
+        job_id = self.events.enqueue_job(
+            user_id,
+            "weekly_action_preference_extract",
+            device_id=device_id,
+            from_event_id=max(0, min(ids) - 1),
+            to_event_id=max(ids),
+        )
+        return {
+            "user_id": user_id,
+            "device_id": device_id,
+            "end_date": end_date,
+            "dates": dates,
+            "created_job": job_id is not None,
+            "job_id": job_id,
+            "input_action_memories": len(memories),
+            "from_event_id": max(0, min(ids) - 1),
+            "to_event_id": max(ids),
+            "process": self.process_memory_jobs_once(limit=2, include_daily=True) if process_now else None,
+        }
 
     def trigger_preference_extraction(
         self,
@@ -585,7 +865,7 @@ class MemoryManager:
             "redis": {"backend": self.redis.backend},
             "sqlite": {"backend": "sqlite", "path": str(self.events.path)},
             "preference_extractor": self.preference_extractor.status(),
-            "jobs": self.events.job_counts(),
+            "jobs": self.events.job_counts(include_daily=True),
             **self.events.stats(),
         }
 
@@ -601,6 +881,42 @@ class MemoryManager:
         if summary:
             self.redis.set_json(self.redis.summary_key(device_id, user_id), summary, self.redis.ttl_seconds)
         return summary
+
+    def _schedule_daily_extraction(
+        self,
+        user_id: str,
+        device_id: str,
+        memory_date: str,
+        user_event_id: int,
+        assistant_event_id: int,
+    ) -> dict[str, Any]:
+        if user_id in {"anonymous", LEGACY_USER_ID}:
+            return {
+                "memory_date": memory_date,
+                "from_event_id": max(0, min(user_event_id, assistant_event_id) - 1),
+                "to_event_id": max(user_event_id, assistant_event_id),
+                "queued": [],
+                "skipped": True,
+                "reason": "user is not eligible for daily extraction",
+            }
+        from_event_id = max(0, min(user_event_id, assistant_event_id) - 1)
+        to_event_id = max(user_event_id, assistant_event_id)
+        queued = []
+        for job_type in ("daily_time_memory_extract", "daily_action_memory_extract"):
+            job_id = self.events.upsert_pending_device_job(
+                user_id,
+                device_id,
+                job_type,
+                from_event_id=from_event_id,
+                to_event_id=to_event_id,
+            )
+            queued.append({"job_type": job_type, "job_id": job_id})
+        return {
+            "memory_date": memory_date,
+            "from_event_id": from_event_id,
+            "to_event_id": to_event_id,
+            "queued": queued,
+        }
 
     def _maybe_schedule_preference(
         self,
@@ -712,6 +1028,258 @@ class MemoryManager:
                 state = self._conversation_states.setdefault(key, _ConversationState())
                 state.summary_pending = False
 
+    def _process_daily_time_memory_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        user_id = str(job["user_id"])
+        device_id = str(job.get("device_id") or "")
+        memory_date = self._job_memory_date(job)
+        messages = self.events.list_events_for_local_date(
+            user_id,
+            device_id,
+            memory_date,
+            event_type="message",
+        )
+        if not messages:
+            return {
+                "skipped": True,
+                "reason": "no messages for local date",
+                "memory_date": memory_date,
+                "event_type": "time_memory",
+            }
+        summary_input = [
+            {
+                "role": item.get("role"),
+                "content": item.get("content"),
+                "id": item.get("id"),
+                "session_id": item.get("session_id"),
+                "created_at": item.get("created_at"),
+            }
+            for item in messages
+            if item.get("role") in {"user", "assistant"}
+        ]
+        summary = self.summarizer.summarize(summary_input, "")
+        if not summary:
+            return {
+                "skipped": True,
+                "reason": "empty daily summary",
+                "memory_date": memory_date,
+                "event_type": "time_memory",
+            }
+        content = f"日期总结（{memory_date}）\n{summary}"
+        event_id = self.events.upsert_daily_time_memory(
+            user_id,
+            device_id,
+            memory_date,
+            content,
+            source_event_ids=[int(item["id"]) for item in messages],
+            metadata={
+                "message_count": len(messages),
+                "session_ids": sorted({str(item.get("session_id")) for item in messages if item.get("session_id")}),
+                "summary_backend": getattr(self.summarizer, "backend", "unknown"),
+            },
+        )
+        return {
+            "skipped": False,
+            "event_type": "time_memory",
+            "event_id": event_id,
+            "memory_date": memory_date,
+            "message_count": len(messages),
+        }
+
+    def _process_daily_action_memory_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        user_id = str(job["user_id"])
+        device_id = str(job.get("device_id") or "")
+        memory_date = self._job_memory_date(job)
+        action_events = self.events.list_events_for_local_date(
+            user_id,
+            device_id,
+            memory_date,
+            event_type="action_sequence",
+        )
+        feedback_events = self.events.list_events_for_local_date(
+            user_id,
+            device_id,
+            memory_date,
+            event_type="action_feedback",
+        )
+        if not action_events and not feedback_events:
+            return {
+                "skipped": True,
+                "reason": "no action_sequence or action_feedback events for local date",
+                "memory_date": memory_date,
+                "event_type": "action_memory",
+            }
+        message_events = self.events.list_events_for_local_date(
+            user_id,
+            device_id,
+            memory_date,
+            event_type="message",
+        )
+        source_message_ids_by_session: dict[str, list[int]] = {}
+        for message in message_events:
+            sid = str(message.get("session_id") or "")
+            if sid:
+                source_message_ids_by_session.setdefault(sid, []).append(int(message["id"]))
+        memories: list[dict[str, Any]] = []
+        for event in action_events:
+            actions = (event.get("payload_json") or {}).get("actions", [])
+            if not isinstance(actions, list) or not actions:
+                continue
+            labels = [
+                str(action.get("label_zh") or action.get("code") or "").strip()
+                for action in actions
+                if isinstance(action, dict) and str(action.get("label_zh") or action.get("code") or "").strip()
+            ]
+            action_text = str(event.get("content") or " -> ".join(labels)).strip()
+            session_id = str(event.get("session_id") or (event.get("payload_json") or {}).get("session_id") or "")
+            memories.append(
+                {
+                    "content": f"动作记忆（{memory_date}）：{action_text}",
+                    "title": f"{memory_date} 动作记忆",
+                    "session_id": session_id or None,
+                    "event_at": event.get("created_at"),
+                    "actions": [dict(action) for action in actions if isinstance(action, dict)],
+                    "source_event_ids": [int(event["id"])],
+                    "source_message_event_ids": source_message_ids_by_session.get(session_id, []),
+                    "confidence": float(((event.get("payload_json") or {}).get("model_route") or {}).get("confidence") or 0.8),
+                    "metadata": {
+                        "source_event_type": "action_sequence",
+                        "source_content": event.get("content"),
+                    },
+                }
+            )
+        for event in feedback_events:
+            payload = event.get("payload_json") or {}
+            feedback_text = str(payload.get("feedback") or event.get("content") or "").strip()
+            if not feedback_text:
+                continue
+            session_id = str(event.get("session_id") or payload.get("session_id") or "")
+            ref = payload.get("action_id") or payload.get("action_event_id") or payload.get("action_memory_id")
+            memories.append(
+                {
+                    "content": f"动作反馈记忆（{memory_date}）：{feedback_text}",
+                    "title": f"{memory_date} 动作反馈记忆",
+                    "session_id": session_id or None,
+                    "event_at": event.get("created_at"),
+                    "actions": [],
+                    "source_event_ids": [int(event["id"])],
+                    "source_message_event_ids": source_message_ids_by_session.get(session_id, []),
+                    "confidence": float((payload.get("model_route") or {}).get("confidence") or 0.8),
+                    "metadata": {
+                        "source_event_type": "action_feedback",
+                        "action_reference": ref,
+                    },
+                }
+            )
+        if not memories:
+            return {
+                "skipped": True,
+                "reason": "no structured action payloads",
+                "memory_date": memory_date,
+                "event_type": "action_memory",
+            }
+        event_ids = self.events.replace_daily_action_memories(user_id, device_id, memory_date, memories)
+        return {
+            "skipped": False,
+            "event_type": "action_memory",
+            "event_ids": event_ids,
+            "memory_date": memory_date,
+            "action_memory_count": len(event_ids),
+            "source_event_ids": [int(event["id"]) for event in action_events + feedback_events],
+        }
+
+    def _process_weekly_action_preference_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        user_id = str(job["user_id"])
+        if user_id in {"anonymous", LEGACY_USER_ID}:
+            return {"skipped": True, "reason": "user is not eligible for weekly action preference memory"}
+        from_id = int(job.get("from_event_id") or 0)
+        to_id = int(job.get("to_event_id") or 0)
+        device_id = str(job.get("device_id") or "")
+        action_memories = [
+            event
+            for event in self.events.list_events(user_id=user_id, device_id=device_id or None, event_type="action_memory", limit=1000, ascending=True)
+            if from_id < int(event["id"]) <= to_id
+        ]
+        if not action_memories:
+            return {"skipped": True, "reason": "no action_memory events in extraction range", "from_event_id": from_id, "to_event_id": to_id}
+        dates = sorted(
+            {
+                str((event.get("payload_json") or {}).get("memory_date") or self._local_date(str(event.get("created_at") or iso_now())))
+                for event in action_memories
+            }
+        )
+        start_date = dates[0]
+        end_date = dates[-1]
+        preference_context = {
+            "context_mode": "weekly_action_memory_preferences",
+            "user_id": user_id,
+            "device_id": device_id or None,
+            "from_event_id": from_id,
+            "to_event_id": to_id,
+            "user_card": self.get_user_card(user_id) or self.restore_user_card(user_id) or {},
+            "action_memory_events": [
+                {
+                    "event_id": event["id"],
+                    "device_id": event["device_id"],
+                    "session_id": event.get("session_id"),
+                    "memory_date": (event.get("payload_json") or {}).get("memory_date"),
+                    "text": event.get("content"),
+                    "created_at": event.get("created_at"),
+                    "actions": (event.get("payload_json") or {}).get("actions", []),
+                }
+                for event in action_memories
+            ],
+            "action_memory_count": len(action_memories),
+        }
+        extraction = self.preference_extractor.extract(user_id, preference_context, [])
+        memories = []
+        for idx, pref in enumerate(extraction.preferences, start=1):
+            text = str(pref.display_text_zh or "").strip()
+            if not text:
+                continue
+            source_event_ids = [int(ev.event_id) for ev in pref.evidence if int(ev.event_id or 0) > 0]
+            if not source_event_ids:
+                source_event_ids = [int(event["id"]) for event in action_memories]
+            memories.append(
+                {
+                    "content": f"七天动作偏好记忆（{start_date} 至 {end_date}）：{text}",
+                    "title": f"{start_date} 至 {end_date} 动作偏好记忆 #{idx}",
+                    "source_event_ids": source_event_ids,
+                    "confidence": pref.confidence,
+                    "metadata": {
+                        "preference_key": pref.preference_key,
+                        "category": pref.category,
+                        "value": pref.value,
+                        "reason_zh": pref.reason_zh,
+                        "extractor_model": getattr(self.preference_extractor, "model", None),
+                        "prompt_version": getattr(self.preference_extractor, "prompt_version", None),
+                    },
+                }
+            )
+        event_ids = self.events.replace_weekly_action_preference_memories(
+            user_id,
+            device_id,
+            start_date,
+            end_date,
+            memories,
+        )
+        return {
+            "skipped": False,
+            "from_event_id": from_id,
+            "to_event_id": to_id,
+            "context_mode": "weekly_action_memory_preferences",
+            "action_memory_count": len(action_memories),
+            "input_events": len(action_memories),
+            "input_action_events": len(action_memories),
+            "stored_action_preference_memories": len(event_ids),
+            "action_preference_memory_event_ids": event_ids,
+            "preference_context_preview": self._preference_context_preview(preference_context),
+        }
+
+    def _job_memory_date(self, job: dict[str, Any]) -> str:
+        event_id = int(job.get("to_event_id") or 0)
+        event = self.events.get_event(event_id) if event_id else None
+        return self._local_date(str((event or {}).get("created_at") or iso_now()))
+
     def _process_preference_job(self, job: dict[str, Any]) -> dict[str, Any]:
         user_id = str(job["user_id"])
         if user_id in {"anonymous", LEGACY_USER_ID}:
@@ -814,6 +1382,61 @@ class MemoryManager:
         }
         return job_result
 
+    def _extract_and_store_preferences(
+        self,
+        user_id: str,
+        preference_context: dict[str, Any],
+        existing: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        changed = False
+        upserted = 0
+        result = self.preference_extractor.extract(user_id, preference_context, existing)
+        model_preferences = list(result.preferences) if result else []
+        model_preference_count = len(model_preferences)
+        model_stored = 0
+        for pref in model_preferences:
+            key, category = normalize_preference_key(pref.preference_key)
+            if pref.action == "revoke":
+                self.events.revoke_preference(user_id, key, pref.value)
+                changed = True
+                upserted += 1
+                continue
+            status = None
+            if key == "other":
+                status = "candidate"
+            pref_id = self.events.upsert_preference(
+                user_id,
+                key,
+                category if key != "other" else pref.category or "other",
+                pref.value,
+                pref.display_text_zh,
+                [item.model_dump() for item in pref.evidence],
+                polarity=pref.polarity,
+                durability=pref.durability,
+                strength=pref.strength,
+                confidence=pref.confidence,
+                source_type=pref.source_type,
+                expires_at=pref.expires_at,
+                extractor_model=self.preference_extractor.model,
+                prompt_version=self.preference_extractor.prompt_version,
+                reason_zh=pref.reason_zh,
+                scope=pref.scope,
+                status=status,
+            )
+            changed = changed or pref_id is not None
+            if pref_id is not None:
+                upserted += 1
+                model_stored += 1
+        if changed:
+            self.events.enqueue_job(user_id, "user_card_rebuild")
+        return {
+            "existing_preference_count": len(existing),
+            "extracted_preferences": model_preference_count,
+            "model_stored_preferences": model_stored,
+            "stored_preferences": upserted,
+            "changed": changed,
+        }
+
     def _build_preference_context(
         self,
         user_id: str,
@@ -910,6 +1533,7 @@ class MemoryManager:
                 for turn in context.get("recent_turns", [])
             ],
             "action_events": context.get("action_events", [])[:5],
+            "action_memory_events": context.get("action_memory_events", [])[:10],
             "existing_preference_count": context.get("existing_preference_count", 0),
         }
 
@@ -949,5 +1573,33 @@ class MemoryManager:
         }
 
     @staticmethod
-    def _seconds_between(start: str, end: str) -> float:
-        return (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds()
+    def _local_date(value: str, timezone_name: str = "Asia/Shanghai") -> str:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return value[:10]
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        return parsed.astimezone(ZoneInfo(timezone_name)).date().isoformat()
+
+    @classmethod
+    def _date_window(cls, end_date: str, days: int) -> list[str]:
+        parsed = cls._parse_datetime(f"{end_date}T00:00:00+08:00")
+        return [
+            (parsed - timedelta(days=offset)).date().isoformat()
+            for offset in range(max(1, days) - 1, -1, -1)
+        ]
+
+    @staticmethod
+    def _parse_datetime(value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            parsed = datetime.fromisoformat(f"{value[:10]}T00:00:00+00:00")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        return parsed
+
+    @classmethod
+    def _seconds_between(cls, start: str, end: str) -> float:
+        return (cls._parse_datetime(end) - cls._parse_datetime(start)).total_seconds()

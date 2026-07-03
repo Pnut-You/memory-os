@@ -125,11 +125,7 @@ class DeviceStateRequest(BaseModel):
 
 class TimeMemoryRequest(BaseModel):
     device_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
-    summary: str = Field(min_length=1, max_length=10_000)
     memory_date: str = Field(min_length=1, max_length=32)
-    memory_at: str = Field(min_length=1, max_length=128)
-    title: str = Field(default="", max_length=200)
-    metadata: dict[str, Any] = {}
 
 
 class EventSummaryRequest(BaseModel):
@@ -145,6 +141,11 @@ class PreferenceExtractRequest(BaseModel):
     device_id: str | None = Field(default=None, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     force: bool = True
     recent_user_messages: int = 20
+
+
+class WeeklyActionPreferenceRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    end_date: str = Field(min_length=1, max_length=32)
 
 
 @asynccontextmanager
@@ -246,6 +247,25 @@ def debug_user_preferences(
     return _router_or_503(request).preferences(user_id)
 
 
+@app.get("/api/debug/users/{user_id}/sessions")
+def debug_user_sessions(
+    request: Request,
+    user_id: str = FastAPIPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    device_id: str | None = Query(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    local_date: str | None = Query(default=None, min_length=1, max_length=32),
+) -> dict:
+    return _router_or_503(request).sessions(user_id, device_id, local_date)
+
+
+@app.get("/api/debug/users/{user_id}/sessions/{session_id}")
+def debug_user_session_detail(
+    request: Request,
+    user_id: str = FastAPIPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    session_id: str = FastAPIPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+) -> dict:
+    return _router_or_503(request).session_detail(user_id, session_id)
+
+
 @app.post("/api/debug/users/{user_id}/preferences/extract")
 def extract_debug_user_preferences(
     payload: PreferenceExtractRequest,
@@ -257,6 +277,19 @@ def extract_debug_user_preferences(
         payload.device_id,
         force=payload.force,
         recent_user_messages=payload.recent_user_messages,
+    )
+
+
+@app.post("/api/debug/users/{user_id}/actions/preferences/extract")
+def extract_debug_weekly_action_preferences(
+    payload: WeeklyActionPreferenceRequest,
+    request: Request,
+    user_id: str = FastAPIPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+) -> dict:
+    return _router_or_503(request).extract_weekly_action_preferences(
+        user_id,
+        payload.device_id,
+        payload.end_date.strip(),
     )
 
 
@@ -276,8 +309,21 @@ def debug_event_library(
     user_id: str | None = Query(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
     device_id: str | None = Query(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
     event_type: str | None = Query(default=None),
+    session_id: str | None = Query(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
 ) -> dict:
-    return _router_or_503(request).event_library(user_id, device_id, event_type)
+    return _router_or_503(request).event_library(user_id, device_id, event_type, session_id)
+
+
+@app.get("/api/memories/events-text")
+def event_text_memories(
+    request: Request,
+    user_id: str | None = Query(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    device_id: str | None = Query(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    event_type: str | None = Query(default="action_memory"),
+    session_id: str | None = Query(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    memory_date: str | None = Query(default=None, min_length=1, max_length=32),
+) -> dict:
+    return _router_or_503(request).event_texts(user_id, device_id, event_type, session_id, memory_date)
 
 
 @app.post("/api/debug/events/summaries")
@@ -319,14 +365,10 @@ def create_debug_time_memory(
     request: Request,
     user_id: str = FastAPIPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
 ) -> dict:
-    return _router_or_503(request).create_time_memory(
+    return _router_or_503(request).extract_daily_memory(
         user_id,
         payload.device_id,
-        payload.summary.strip(),
         payload.memory_date.strip(),
-        payload.memory_at.strip(),
-        payload.title.strip(),
-        payload.metadata,
     )
 
 
