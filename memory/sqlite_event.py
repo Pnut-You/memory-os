@@ -131,6 +131,7 @@ class SQLiteEventStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
                 device_id TEXT NOT NULL,
+                local_date TEXT,
                 summary_text TEXT NOT NULL,
                 compacted_through_event_id INTEGER NOT NULL,
                 version INTEGER NOT NULL,
@@ -269,6 +270,11 @@ class SQLiteEventStore:
         self._ensure_column("conversation_summaries", "from_event_id", "INTEGER")
         self._ensure_column("conversation_summaries", "to_event_id", "INTEGER")
         self._ensure_column("conversation_summaries", "turn_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("conversation_summaries", "local_date", "TEXT")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_summaries_user_device_date ON conversation_summaries(user_id, device_id, local_date, version)"
+        )
+        self._conn.commit()
         self._ensure_memory_jobs_accepts_extraction_types()
 
     def upsert_session(
@@ -676,12 +682,16 @@ class SQLiteEventStore:
             return []
         return self.conversation_turns_until(user_id, device_id, latest_id + 1_000_000_000, limit, session_id=session_id)
 
-    def latest_summary(self, user_id: str, device_id: str) -> dict[str, Any] | None:
+    def latest_summary(self, user_id: str, device_id: str, local_date: str | None = None) -> dict[str, Any] | None:
+        where = "WHERE user_id=? AND device_id=?"
+        params: list[Any] = [user_id, device_id]
+        if local_date:
+            where += " AND local_date=?"
+            params.append(local_date)
         with self._lock:
             row = self._conn.execute(
-                """SELECT * FROM conversation_summaries
-                WHERE user_id=? AND device_id=? ORDER BY version DESC,id DESC LIMIT 1""",
-                (user_id, device_id),
+                f"SELECT * FROM conversation_summaries {where} ORDER BY version DESC,id DESC LIMIT 1",
+                params,
             ).fetchone()
         return dict(row) if row else None
 
@@ -695,16 +705,18 @@ class SQLiteEventStore:
         from_event_id: int | None = None,
         to_event_id: int | None = None,
         turn_count: int = 0,
+        local_date: str | None = None,
     ) -> int:
         with self._lock:
             cursor = self._conn.execute(
                 """INSERT INTO conversation_summaries
-                (user_id,device_id,summary_text,compacted_through_event_id,version,
+                (user_id,device_id,local_date,summary_text,compacted_through_event_id,version,
                  from_event_id,to_event_id,turn_count,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?)""",
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (
                     user_id,
                     device_id,
+                    local_date,
                     summary_text,
                     compacted_through_event_id,
                     version,
@@ -717,12 +729,21 @@ class SQLiteEventStore:
             self._conn.commit()
             return int(cursor.lastrowid)
 
-    def list_summaries(self, user_id: str, device_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    def list_summaries(
+        self,
+        user_id: str,
+        device_id: str | None = None,
+        limit: int = 20,
+        local_date: str | None = None,
+    ) -> list[dict[str, Any]]:
         params: list[Any] = [user_id]
         where = "WHERE user_id=?"
         if device_id:
             where += " AND device_id=?"
             params.append(device_id)
+        if local_date:
+            where += " AND local_date=?"
+            params.append(local_date)
         params.append(limit)
         with self._lock:
             rows = self._conn.execute(
@@ -1058,13 +1079,20 @@ class SQLiteEventStore:
         rows = self.list_events(
             user_id=user_id,
             device_id=device_id,
-            session_id=session_id,
             event_type="action_memory",
             limit=limit,
             ascending=False,
         )
         if memory_date:
             rows = [row for row in rows if (row.get("payload_json") or {}).get("memory_date") == memory_date]
+        if session_id:
+            rows = [
+                row
+                for row in rows
+                if row.get("session_id") == session_id
+                or (row.get("payload_json") or {}).get("session_id") == session_id
+                or session_id in ((row.get("payload_json") or {}).get("metadata") or {}).get("session_ids", [])
+            ]
         return rows
 
     def list_event_memories(
