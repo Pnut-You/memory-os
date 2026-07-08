@@ -131,6 +131,7 @@ class SQLiteEventStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
                 device_id TEXT NOT NULL,
+                session_id TEXT,
                 local_date TEXT,
                 summary_text TEXT NOT NULL,
                 compacted_through_event_id INTEGER NOT NULL,
@@ -146,6 +147,7 @@ class SQLiteEventStore:
             CREATE TABLE IF NOT EXISTS user_preferences (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
+                device_id TEXT NOT NULL DEFAULT 'legacy-unassigned',
                 preference_key TEXT NOT NULL,
                 category TEXT NOT NULL,
                 value_type TEXT NOT NULL,
@@ -175,18 +177,9 @@ class SQLiteEventStore:
                 CHECK (strength >= 0 AND strength <= 1),
                 CHECK (json_valid(value_json))
             );
-            CREATE INDEX IF NOT EXISTS idx_preferences_user_active
-                ON user_preferences(user_id, category, preference_key)
-                WHERE status = 'active';
             DROP INDEX IF EXISTS uq_active_user_preference;
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_active_single_value_preference
-                ON user_preferences(user_id, preference_key)
-                WHERE status = 'active'
-                  AND preference_key NOT IN ('preference.likes','preference.dislikes');
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_active_multi_value_preference
-                ON user_preferences(user_id, preference_key, value_json)
-                WHERE status = 'active'
-                  AND preference_key IN ('preference.likes','preference.dislikes');
+            DROP INDEX IF EXISTS uq_active_single_value_preference;
+            DROP INDEX IF EXISTS uq_active_multi_value_preference;
 
             CREATE TABLE IF NOT EXISTS preference_evidence (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,6 +255,8 @@ class SQLiteEventStore:
         self._conn.commit()
         self._ensure_column("user_preferences", "reason_zh", "TEXT")
         self._ensure_column("user_preferences", "scope", "TEXT NOT NULL DEFAULT 'user'")
+        self._ensure_column("user_preferences", "device_id", "TEXT NOT NULL DEFAULT 'legacy-unassigned'")
+        self._ensure_preference_device_indexes()
         self._ensure_column("events", "session_id", "TEXT")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_session ON events(user_id, session_id, id)"
@@ -271,8 +266,9 @@ class SQLiteEventStore:
         self._ensure_column("conversation_summaries", "to_event_id", "INTEGER")
         self._ensure_column("conversation_summaries", "turn_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("conversation_summaries", "local_date", "TEXT")
+        self._ensure_column("conversation_summaries", "session_id", "TEXT")
         self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_summaries_user_device_date ON conversation_summaries(user_id, device_id, local_date, version)"
+            "CREATE INDEX IF NOT EXISTS idx_summaries_user_device_session_date ON conversation_summaries(user_id, device_id, session_id, local_date, version)"
         )
         self._conn.commit()
         self._ensure_memory_jobs_accepts_extraction_types()
@@ -495,9 +491,17 @@ class SQLiteEventStore:
         )
         return [row for row in rows if self._local_date(row.get("created_at")) == memory_date]
 
-    def count_user_messages_since(self, user_id: str, after_event_id: int | None) -> int:
+    def count_user_messages_since(
+        self,
+        user_id: str,
+        after_event_id: int | None,
+        device_id: str | None = None,
+    ) -> int:
         clause = "user_id=? AND role='user'"
         params: list[Any] = [user_id]
+        if device_id:
+            clause += " AND device_id=?"
+            params.append(device_id)
         if after_event_id:
             clause += " AND id>?"
             params.append(after_event_id)
@@ -516,13 +520,18 @@ class SQLiteEventStore:
             ).fetchone()
         return int(row["id"]) if row and row["id"] is not None else None
 
-    def latest_preference_extraction_event_id(self, user_id: str) -> int:
+    def latest_preference_extraction_event_id(self, user_id: str, device_id: str | None = None) -> int:
+        where = "user_id=? AND job_type='preference_extraction' AND status='succeeded'"
+        params: list[Any] = [user_id]
+        if device_id:
+            where += " AND device_id=?"
+            params.append(device_id)
         with self._lock:
             row = self._conn.execute(
                 """SELECT MAX(COALESCE(to_event_id,0)) AS event_id
                 FROM memory_jobs
-                WHERE user_id=? AND job_type='preference_extraction' AND status='succeeded'""",
-                (user_id,),
+                WHERE """ + where,
+                params,
             ).fetchone()
         return int(row["event_id"] or 0) if row else 0
 
@@ -682,9 +691,18 @@ class SQLiteEventStore:
             return []
         return self.conversation_turns_until(user_id, device_id, latest_id + 1_000_000_000, limit, session_id=session_id)
 
-    def latest_summary(self, user_id: str, device_id: str, local_date: str | None = None) -> dict[str, Any] | None:
+    def latest_summary(
+        self,
+        user_id: str,
+        device_id: str,
+        local_date: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
         where = "WHERE user_id=? AND device_id=?"
         params: list[Any] = [user_id, device_id]
+        if session_id:
+            where += " AND session_id=?"
+            params.append(session_id)
         if local_date:
             where += " AND local_date=?"
             params.append(local_date)
@@ -706,16 +724,18 @@ class SQLiteEventStore:
         to_event_id: int | None = None,
         turn_count: int = 0,
         local_date: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         with self._lock:
             cursor = self._conn.execute(
                 """INSERT INTO conversation_summaries
-                (user_id,device_id,local_date,summary_text,compacted_through_event_id,version,
+                (user_id,device_id,session_id,local_date,summary_text,compacted_through_event_id,version,
                  from_event_id,to_event_id,turn_count,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     user_id,
                     device_id,
+                    session_id,
                     local_date,
                     summary_text,
                     compacted_through_event_id,
@@ -735,12 +755,16 @@ class SQLiteEventStore:
         device_id: str | None = None,
         limit: int = 20,
         local_date: str | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         params: list[Any] = [user_id]
         where = "WHERE user_id=?"
         if device_id:
             where += " AND device_id=?"
             params.append(device_id)
+        if session_id:
+            where += " AND session_id=?"
+            params.append(session_id)
         if local_date:
             where += " AND local_date=?"
             params.append(local_date)
@@ -1256,8 +1280,10 @@ class SQLiteEventStore:
         reason_zh: str | None = None,
         scope: str = "user",
         status: str | None = None,
+        device_id: str | None = None,
     ) -> int | None:
         now = iso_now()
+        preference_device_id = device_id or LEGACY_USER_ID
         value_type = str(value.get("type") or "json")
         value_json = self._json(value)
         target_status = status or ("active" if source_type == "explicit" and confidence >= 0.85 else "candidate")
@@ -1269,6 +1295,7 @@ class SQLiteEventStore:
         with self._lock:
             active, duplicate_ids = self._active_preference_for_value(
                 user_id,
+                preference_device_id,
                 preference_key,
                 value,
                 display_text_zh,
@@ -1280,6 +1307,7 @@ class SQLiteEventStore:
                 pref_id = int(active["id"])
                 self._revoke_opposite_value_preference(
                     user_id,
+                    preference_device_id,
                     preference_key,
                     value,
                     display_text_zh,
@@ -1322,6 +1350,7 @@ class SQLiteEventStore:
                     )
                 self._revoke_opposite_value_preference(
                     user_id,
+                    preference_device_id,
                     preference_key,
                     value,
                     display_text_zh,
@@ -1330,13 +1359,14 @@ class SQLiteEventStore:
                 )
                 cursor = self._conn.execute(
                     """INSERT INTO user_preferences
-                    (user_id,preference_key,category,value_type,value_json,display_text_zh,
+                    (user_id,device_id,preference_key,category,value_type,value_json,display_text_zh,
                     polarity,durability,strength,confidence,source_type,status,evidence_count,
                     first_seen_at,last_confirmed_at,expires_at,revision,supersedes_id,
                     extractor_model,prompt_version,reason_zh,scope,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         user_id,
+                        preference_device_id,
                         preference_key,
                         category,
                         value_type,
@@ -1388,8 +1418,10 @@ class SQLiteEventStore:
         user_id: str,
         preference_key: str,
         value: dict[str, Any] | None = None,
+        device_id: str | None = None,
     ) -> None:
         value_json = self._json(value) if value is not None else None
+        preference_device_id = device_id or LEGACY_USER_ID
         if preference_key in {"preference.likes", "preference.dislikes"} and value is None:
             return
         with self._lock:
@@ -1397,13 +1429,13 @@ class SQLiteEventStore:
             if value_json is None:
                 self._conn.execute(
                     """UPDATE user_preferences SET status='revoked',updated_at=?
-                    WHERE user_id=? AND preference_key=? AND status='active'""",
-                    (now, user_id, preference_key),
+                    WHERE user_id=? AND device_id=? AND preference_key=? AND status='active'""",
+                    (now, user_id, preference_device_id, preference_key),
                 )
             else:
                 if preference_key in {"preference.likes", "preference.dislikes"}:
                     target_key = self.normalized_preference_value_key(preference_key, value)
-                    rows = self._active_preference_rows(user_id, preference_key)
+                    rows = self._active_preference_rows(user_id, preference_device_id, preference_key)
                     for row in rows:
                         if self.normalized_preference_value_key(
                             preference_key,
@@ -1417,14 +1449,15 @@ class SQLiteEventStore:
                 else:
                     self._conn.execute(
                         """UPDATE user_preferences SET status='revoked',updated_at=?
-                        WHERE user_id=? AND preference_key=? AND value_json=? AND status='active'""",
-                        (now, user_id, preference_key, value_json),
+                        WHERE user_id=? AND device_id=? AND preference_key=? AND value_json=? AND status='active'""",
+                        (now, user_id, preference_device_id, preference_key, value_json),
                     )
             self._conn.commit()
 
     def _active_preference_for_value(
         self,
         user_id: str,
+        device_id: str,
         preference_key: str,
         value: dict[str, Any],
         display_text_zh: str = "",
@@ -1433,7 +1466,7 @@ class SQLiteEventStore:
             target_key = self.normalized_preference_value_key(preference_key, value, display_text_zh)
             matches = [
                 row
-                for row in self._active_preference_rows(user_id, preference_key)
+                for row in self._active_preference_rows(user_id, device_id, preference_key)
                 if self.normalized_preference_value_key(
                     preference_key,
                     self._loads(row["value_json"], {}),
@@ -1446,14 +1479,15 @@ class SQLiteEventStore:
             return matches[0], [int(row["id"]) for row in matches[1:]]
         row = self._conn.execute(
             """SELECT * FROM user_preferences
-            WHERE user_id=? AND preference_key=? AND status='active'""",
-            (user_id, preference_key),
+            WHERE user_id=? AND device_id=? AND preference_key=? AND status='active'""",
+            (user_id, device_id, preference_key),
         ).fetchone()
         return row, []
 
     def _revoke_opposite_value_preference(
         self,
         user_id: str,
+        device_id: str,
         preference_key: str,
         value: dict[str, Any],
         display_text_zh: str,
@@ -1470,7 +1504,7 @@ class SQLiteEventStore:
         if not opposite:
             return
         target_key = self.normalized_preference_value_key(preference_key, value, display_text_zh)
-        for row in self._active_preference_rows(user_id, opposite):
+        for row in self._active_preference_rows(user_id, device_id, opposite):
             if self.normalized_preference_value_key(
                 opposite,
                 self._loads(row["value_json"], {}),
@@ -1482,12 +1516,12 @@ class SQLiteEventStore:
                 (now, int(row["id"])),
             )
 
-    def _active_preference_rows(self, user_id: str, preference_key: str) -> list[sqlite3.Row]:
+    def _active_preference_rows(self, user_id: str, device_id: str, preference_key: str) -> list[sqlite3.Row]:
         return self._conn.execute(
             """SELECT * FROM user_preferences
-            WHERE user_id=? AND preference_key=? AND status='active'
+            WHERE user_id=? AND device_id=? AND preference_key=? AND status='active'
             ORDER BY evidence_count DESC,id DESC""",
-            (user_id, preference_key),
+            (user_id, device_id, preference_key),
         ).fetchall()
 
     def _supersede_duplicate_preferences(self, pref_id: int, duplicate_ids: list[int], now: str) -> None:
@@ -1546,9 +1580,13 @@ class SQLiteEventStore:
         user_id: str,
         status: str | None = None,
         limit: int = 100,
+        device_id: str | None = None,
     ) -> list[dict[str, Any]]:
         params: list[Any] = [user_id]
         where = "WHERE user_id=?"
+        if device_id:
+            where += " AND device_id=?"
+            params.append(device_id)
         if status:
             where += " AND status=?"
             params.append(status)
@@ -1560,16 +1598,27 @@ class SQLiteEventStore:
             ).fetchall()
         return [self._decode_row(row, ("value_json",)) for row in rows]
 
-    def list_preference_evidence(self, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    def list_preference_evidence(
+        self,
+        user_id: str,
+        limit: int = 100,
+        device_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE p.user_id=?"
+        params: list[Any] = [user_id]
+        if device_id:
+            where += " AND p.device_id=?"
+            params.append(device_id)
+        params.append(limit)
         with self._lock:
             rows = self._conn.execute(
                 """SELECT e.*, p.preference_key, p.display_text_zh, ev.content AS source_content
                 FROM preference_evidence e
                 JOIN user_preferences p ON p.id=e.preference_id
                 JOIN events ev ON ev.id=e.event_id
-                WHERE p.user_id=?
+                """ + where + """
                 ORDER BY e.id DESC LIMIT ?""",
-                (user_id, limit),
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1598,8 +1647,9 @@ class SQLiteEventStore:
                 if job_type == "preference_extraction":
                     self._conn.execute(
                         """UPDATE memory_jobs SET to_event_id=MAX(COALESCE(to_event_id,0),?),
-                        updated_at=? WHERE user_id=? AND job_type=? AND status IN ('pending','running')""",
-                        (to_event_id or 0, now, user_id, job_type),
+                        updated_at=? WHERE user_id=? AND COALESCE(device_id,'')=COALESCE(?,'')
+                        AND job_type=? AND status IN ('pending','running')""",
+                        (to_event_id or 0, now, user_id, device_id, job_type),
                     )
                     self._conn.commit()
                     return None
@@ -1655,10 +1705,11 @@ class SQLiteEventStore:
         with self._lock:
             row = self._conn.execute(
                 """SELECT id FROM memory_jobs
-                WHERE user_id=? AND job_type='preference_extraction'
+                WHERE user_id=? AND COALESCE(device_id,'')=COALESCE(?,'')
+                    AND job_type='preference_extraction'
                     AND status IN ('pending','running','failed')
                 ORDER BY id DESC LIMIT 1""",
-                (user_id,),
+                (user_id, device_id),
             ).fetchone()
             if row:
                 job_id = int(row["id"])
@@ -1724,11 +1775,12 @@ class SQLiteEventStore:
                     AND NOT EXISTS (
                         SELECT 1 FROM memory_jobs active
                         WHERE active.user_id=memory_jobs.user_id
+                            AND COALESCE(active.device_id,'')=COALESCE(memory_jobs.device_id,'')
                             AND active.job_type=memory_jobs.job_type
                             AND active.status IN ('pending','running')
                             AND active.id != memory_jobs.id
                     )
-                    GROUP BY user_id, job_type
+                    GROUP BY user_id, COALESCE(device_id,''), job_type
                 )
                 ORDER BY id LIMIT ?""",
                 params,
@@ -1861,10 +1913,16 @@ class SQLiteEventStore:
             self._conn.commit()
         return counts
 
-    def search_user_text(self, user_id: str, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def search_user_text(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 5,
+        device_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         query_tokens = tokenize(query)
         scored: list[tuple[int, dict[str, Any]]] = []
-        for event in self.list_events(user_id=user_id, event_type="message", limit=1000, ascending=True):
+        for event in self.list_events(user_id=user_id, device_id=device_id, event_type="message", limit=1000, ascending=True):
             score = len(query_tokens & tokenize(str(event.get("content", ""))))
             if score:
                 scored.append((score, event))
@@ -1976,6 +2034,40 @@ class SQLiteEventStore:
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
             self._conn.commit()
 
+    def _ensure_preference_device_indexes(self) -> None:
+        with self._lock:
+            for name in (
+                "idx_preferences_user_active",
+                "uq_active_user_preference",
+                "uq_active_single_value_preference",
+                "uq_active_multi_value_preference",
+                "uq_pending_preference_job",
+            ):
+                self._conn.execute(f"DROP INDEX IF EXISTS {name}")
+            self._conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_preferences_user_active
+                ON user_preferences(user_id, device_id, category, preference_key)
+                WHERE status = 'active'"""
+            )
+            self._conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_active_single_value_preference
+                ON user_preferences(user_id, device_id, preference_key)
+                WHERE status = 'active'
+                  AND preference_key NOT IN ('preference.likes','preference.dislikes')"""
+            )
+            self._conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_active_multi_value_preference
+                ON user_preferences(user_id, device_id, preference_key, value_json)
+                WHERE status = 'active'
+                  AND preference_key IN ('preference.likes','preference.dislikes')"""
+            )
+            self._conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_preference_job
+                ON memory_jobs(user_id, device_id, job_type)
+                WHERE job_type='preference_extraction' AND status IN ('pending','running')"""
+            )
+            self._conn.commit()
+
     def _ensure_memory_jobs_accepts_extraction_types(self) -> None:
         row = self._conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_jobs'"
@@ -2016,7 +2108,7 @@ class SQLiteEventStore:
             self._conn.execute("DROP TABLE memory_jobs_old")
             self._conn.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_preference_job
-                ON memory_jobs(user_id, job_type)
+                ON memory_jobs(user_id, device_id, job_type)
                 WHERE job_type='preference_extraction' AND status IN ('pending','running')"""
             )
             self._conn.execute(

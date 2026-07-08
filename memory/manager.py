@@ -52,6 +52,9 @@ class MemoryManager:
         preference_extract_max_attempts: int = 3,
         session_idle_seconds: int = 15,
         session_ttl_seconds: int = 86400,
+        short_memory_summary_min_turns: int | None = None,
+        short_memory_prompt_trigger_tokens: int = 5000,
+        short_memory_retain_recent_turns: int | None = None,
     ) -> None:
         self.redis = short_term
         self.events = events
@@ -62,6 +65,15 @@ class MemoryManager:
         if summary_retain_turns <= 0 or summary_retain_turns >= self.summary_every_turns:
             raise ValueError("summary_retain_turns must be > 0 and < summary_every_turns")
         self.summary_retain_turns = summary_retain_turns
+        self.short_memory_summary_min_turns = max(
+            1, short_memory_summary_min_turns if short_memory_summary_min_turns is not None else summary_every_turns
+        )
+        self.short_memory_prompt_trigger_tokens = max(1, short_memory_prompt_trigger_tokens)
+        self.short_memory_retain_recent_turns = max(
+            1, short_memory_retain_recent_turns if short_memory_retain_recent_turns is not None else summary_retain_turns
+        )
+        if self.short_memory_retain_recent_turns >= self.short_memory_summary_min_turns:
+            raise ValueError("short_memory_retain_recent_turns must be < short_memory_summary_min_turns")
         self.device_state_ttl_seconds = device_state_ttl_seconds
         self.device_heartbeat_seconds = device_heartbeat_seconds
         self.tool_run_ttl_seconds = tool_run_ttl_seconds
@@ -117,6 +129,9 @@ class MemoryManager:
             config.preference_extract_min_new_user_messages,
             config.preference_extract_batch_size,
             config.preference_extract_max_attempts,
+            short_memory_summary_min_turns=config.short_memory_summary_min_turns,
+            short_memory_prompt_trigger_tokens=config.short_memory_prompt_trigger_tokens,
+            short_memory_retain_recent_turns=config.short_memory_retain_recent_turns,
         )
         if start_scheduler:
             manager.start_memory_worker()
@@ -208,26 +223,28 @@ class MemoryManager:
     ) -> dict[str, Any]:
         session = self.resolve_session(user_id, device_id, timestamp=timestamp, session_id=session_id)
         local_date = str(session.get("local_date") or self._local_date(timestamp or iso_now()))
-        bundle = self.redis.get_context_bundle(device_id, user_id, recent_limit=10)
+        session_id = str(session["session_id"])
+        bundle = self.redis.get_context_bundle(user_id, device_id, session_id, recent_limit=10)
         summary = bundle["summary"]
         if summary and str(summary.get("local_date") or "") != local_date:
             summary = None
-        summary = summary or self._restore_summary(user_id, device_id, local_date)
-        user_card = bundle["user_card"] or self.restore_user_card(user_id)
-        recent = self.redis.get_session_conversation(user_id, session["session_id"], limit=10)
+        summary = summary or self._restore_summary(user_id, device_id, local_date, session_id)
+        user_card = bundle["user_card"] or self.restore_user_card(user_id, device_id)
+        recent = self.redis.get_session_conversation(user_id, device_id, session_id, limit=10)
         if not recent:
             latest_summary_id = int((summary or {}).get("compacted_through_event_id", 0) or 0)
             recent = self.events.message_range(
                 user_id,
                 device_id,
                 latest_summary_id,
-                20,
-                session_id=session["session_id"],
+                self.short_memory_retain_recent_turns * 2,
+                session_id=session_id,
             )[-10:]
             if recent:
                 self.redis.append_session_conversation(
                     user_id,
-                    session["session_id"],
+                    device_id,
+                    session_id,
                     recent,
                     ttl_seconds=self.session_ttl_seconds,
                     max_items=20,
@@ -236,12 +253,12 @@ class MemoryManager:
         return {
             "user_id": user_id,
             "device_id": device_id,
-            "session_id": session["session_id"],
+            "session_id": session_id,
             "session": session,
             "user_card": user_card,
             "rolling_summary": (summary or {}).get("summary_text", ""),
             "summary_version": int((summary or {}).get("version", 0) or 0),
-            "summary_pending": self._conversation_states.get((user_id, device_id, local_date), _ConversationState()).summary_pending,
+            "summary_pending": self._conversation_states.get((user_id, device_id, session_id, local_date), _ConversationState()).summary_pending,
             "recent_messages": recent[-10:],
             "latest_action_sequence": latest_action,
         }
@@ -256,6 +273,7 @@ class MemoryManager:
         timestamp: str | None = None,
         model_event_routes: list[dict[str, Any]] | None = None,
         session_id: str | None = None,
+        prompt_token_count: int | None = None,
     ) -> dict[str, Any]:
         timestamp = timestamp or iso_now()
         session = self.resolve_session(user_id, device_id, timestamp=timestamp, session_id=session_id)
@@ -274,10 +292,11 @@ class MemoryManager:
         ]
         self.redis.append_session_conversation(
             user_id,
+            device_id,
             session["session_id"],
             messages,
             ttl_seconds=self.session_ttl_seconds,
-            max_items=self.summary_every_turns * 2,
+            max_items=max(self.short_memory_summary_min_turns, self.short_memory_retain_recent_turns) * 2,
         )
         routed: dict[str, Any] = {}
         if model_event_routes:
@@ -295,7 +314,13 @@ class MemoryManager:
             )
         memory_date = self._local_date(timestamp)
         daily_jobs = self._schedule_daily_extraction(user_id, device_id, memory_date, user_event_id, assistant_event_id)
-        self._schedule_summary(user_id, device_id, memory_date)
+        self._schedule_summary(
+            user_id,
+            device_id,
+            str(session["session_id"]),
+            memory_date,
+            prompt_token_count=prompt_token_count,
+        )
         if user_id != "anonymous":
             self._maybe_schedule_preference(
                 user_id,
@@ -441,31 +466,31 @@ class MemoryManager:
     ) -> int:
         return self.time_memory.remember(user_id, device_id, content, timestamp, metadata)
 
-    def search(self, user_id: str, query: str, limit: int = 5) -> dict[str, Any]:
-        card = self.get_user_card(user_id)
-        events = self.events.search_user_text(user_id, query, limit)
+    def search(self, user_id: str, query: str, limit: int = 5, device_id: str | None = None) -> dict[str, Any]:
+        card = self.get_user_card(user_id, device_id) if device_id else None
+        events = self.events.search_user_text(user_id, query, limit, device_id=device_id)
         active = [
             pref
-            for pref in self.events.list_preferences(user_id, status="active", limit=100)
+            for pref in self.events.list_preferences(user_id, status="active", limit=100, device_id=device_id)
             if tokenize(query) & tokenize(str(pref))
         ][:limit]
         return {"user_card": card, "events": events, "preferences": active}
 
-    def get_user_card(self, user_id: str) -> dict[str, Any] | None:
-        return self.redis.get_json(self.redis.user_card_key(user_id))
+    def get_user_card(self, user_id: str, device_id: str | None = None) -> dict[str, Any] | None:
+        return self.redis.get_json(self.redis.user_card_key(user_id, device_id))
 
-    def restore_user_card(self, user_id: str) -> dict[str, Any] | None:
-        preferences = self.events.list_preferences(user_id, status="active", limit=15)
+    def restore_user_card(self, user_id: str, device_id: str | None = None) -> dict[str, Any] | None:
+        preferences = self.events.list_preferences(user_id, status="active", limit=15, device_id=device_id)
         if not preferences:
             return None
-        card = self._build_user_card(user_id, preferences)
-        self.redis.set_json(self.redis.user_card_key(user_id), card, self.redis.ttl_seconds)
+        card = self._build_user_card(user_id, preferences, device_id)
+        self.redis.set_json(self.redis.user_card_key(user_id, device_id), card, self.redis.ttl_seconds)
         return card
 
-    def rebuild_user_card(self, user_id: str) -> dict[str, Any] | None:
-        card = self.restore_user_card(user_id)
+    def rebuild_user_card(self, user_id: str, device_id: str | None = None) -> dict[str, Any] | None:
+        card = self.restore_user_card(user_id, device_id)
         if card is None:
-            self.redis.delete_key(self.redis.user_card_key(user_id))
+            self.redis.delete_key(self.redis.user_card_key(user_id, device_id))
         return card
 
     def process_memory_jobs_once(self, limit: int | None = None, include_daily: bool = False) -> dict[str, Any]:
@@ -499,9 +524,20 @@ class MemoryManager:
                 if job["job_type"] == "preference_extraction":
                     job_result = self._process_preference_job(job)
                 elif job["job_type"] == "user_card_rebuild":
-                    self.rebuild_user_card(str(job["user_id"]))
+                    self.rebuild_user_card(str(job["user_id"]), str(job.get("device_id") or "") or None)
                 elif job["job_type"] == "conversation_summary":
-                    self._run_summary(str(job["user_id"]), str(job["device_id"]), self._job_memory_date(job))
+                    session = self.events.latest_session(
+                        str(job["user_id"]),
+                        str(job["device_id"]),
+                        self._job_memory_date(job),
+                    )
+                    if session:
+                        self._run_summary(
+                            str(job["user_id"]),
+                            str(job["device_id"]),
+                            str(session["session_id"]),
+                            self._job_memory_date(job),
+                        )
                 elif job["job_type"] == "daily_time_memory_extract":
                     job_result = self._process_daily_time_memory_job(job)
                 elif job["job_type"] == "daily_action_memory_extract":
@@ -716,8 +752,12 @@ class MemoryManager:
                 "process": self.process_memory_jobs_once(limit=1),
             }
         latest_event_id = self.events.latest_user_event_id(user_id, device_id if force_recent else None) or 0
-        latest_global_event_id = self.events.latest_user_event_id(user_id) or 0
-        latest_processed_id = self.events.latest_preference_extraction_event_id(user_id)
+        latest_global_event_id = (
+            self.events.latest_user_event_id(user_id, device_id)
+            if device_id
+            else self.events.latest_user_event_id(user_id)
+        ) or 0
+        latest_processed_id = self.events.latest_preference_extraction_event_id(user_id, device_id)
         mode = "force_recent" if force_recent else "new_only"
         input_user_events = 0
         input_action_events = 0
@@ -959,10 +999,16 @@ class MemoryManager:
         self._summary_executor.shutdown(wait=True, cancel_futures=False)
         self.events.close()
 
-    def _restore_summary(self, user_id: str, device_id: str, local_date: str | None = None) -> dict[str, Any] | None:
-        summary = self.events.latest_summary(user_id, device_id, local_date)
+    def _restore_summary(
+        self,
+        user_id: str,
+        device_id: str,
+        local_date: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        summary = self.events.latest_summary(user_id, device_id, local_date, session_id=session_id)
         if summary:
-            self.redis.set_json(self.redis.summary_key(device_id, user_id), summary, self.redis.ttl_seconds)
+            self.redis.set_json(self.redis.summary_key(user_id, device_id, session_id), summary, self.redis.ttl_seconds)
         return summary
 
     def _schedule_daily_extraction(
@@ -1010,11 +1056,11 @@ class MemoryManager:
     ) -> None:
         if user_id in {"anonymous", LEGACY_USER_ID}:
             return
-        latest_job_to = self.events.latest_preference_extraction_event_id(user_id)
+        latest_job_to = self.events.latest_preference_extraction_event_id(user_id, device_id)
         # Duplicate pending jobs are collapsed by a unique partial index.
         should = should_schedule_preference(user_text)
         if not should:
-            should = self.events.count_user_messages_since(user_id, latest_job_to) >= self.preference_extract_min_new_user_messages
+            should = self.events.count_user_messages_since(user_id, latest_job_to, device_id) >= self.preference_extract_min_new_user_messages
         if should:
             self.events.enqueue_job(
                 user_id,
@@ -1024,35 +1070,68 @@ class MemoryManager:
                 to_event_id=user_event_id,
             )
 
-    def _schedule_summary(self, user_id: str, device_id: str, local_date: str) -> None:
-        key = (user_id, device_id, local_date)
+    def _schedule_summary(
+        self,
+        user_id: str,
+        device_id: str,
+        session_id: str,
+        local_date: str,
+        *,
+        prompt_token_count: int | None,
+    ) -> None:
+        if prompt_token_count is None or prompt_token_count < self.short_memory_prompt_trigger_tokens:
+            return
+        key = (user_id, device_id, session_id, local_date)
         with self._lock:
             state = self._conversation_states.setdefault(key, _ConversationState())
             if state.summary_pending:
                 return
-            latest = self.events.latest_summary(user_id, device_id, local_date)
+            latest = self.events.latest_summary(user_id, device_id, local_date, session_id=session_id)
             after_id = int(latest["compacted_through_event_id"]) if latest else 0
-            turns = self._conversation_turns_after_for_date(user_id, device_id, after_id, local_date, self.summary_every_turns)
-            if len(turns) < self.summary_every_turns:
+            turns = self._conversation_turns_after_for_date(
+                user_id,
+                device_id,
+                session_id,
+                after_id,
+                local_date,
+                self.short_memory_summary_min_turns,
+            )
+            if len(turns) < self.short_memory_summary_min_turns:
                 return
             state.summary_pending = True
-            future = self._summary_executor.submit(self._run_summary, user_id, device_id, local_date)
+            future = self._summary_executor.submit(self._run_summary, user_id, device_id, session_id, local_date)
             self._summary_futures.add(future)
             future.add_done_callback(self._summary_futures.discard)
 
-    def _run_summary(self, user_id: str, device_id: str, local_date: str) -> None:
-        key = (user_id, device_id, local_date)
+    def _run_summary(self, user_id: str, device_id: str, session_id: str, local_date: str) -> None:
+        key = (user_id, device_id, session_id, local_date)
         try:
-            latest = self.events.latest_summary(user_id, device_id, local_date)
+            latest = self.events.latest_summary(user_id, device_id, local_date, session_id=session_id)
             after_id = int(latest["compacted_through_event_id"]) if latest else 0
             version = int(latest["version"]) + 1 if latest else 1
-            compact_turn_count = self.summary_every_turns - self.summary_retain_turns
-            turns = self._conversation_turns_after_for_date(user_id, device_id, after_id, local_date, self.summary_every_turns)
-            if len(turns) < self.summary_every_turns:
+            turns = self._conversation_turns_after_for_date(
+                user_id,
+                device_id,
+                session_id,
+                after_id,
+                local_date,
+                5000,
+            )
+            if len(turns) < self.short_memory_summary_min_turns:
+                return
+            compact_turn_count = max(0, len(turns) - self.short_memory_retain_recent_turns)
+            if compact_turn_count <= 0:
                 return
             compact_turns = turns[:compact_turn_count]
             compacted_through = int(compact_turns[-1]["assistant"]["id"])
-            summary_turns = self._conversation_turns_until_for_date(user_id, device_id, compacted_through, local_date, 20)
+            summary_turns = self._conversation_turns_until_for_date(
+                user_id,
+                device_id,
+                session_id,
+                compacted_through,
+                local_date,
+                5000,
+            )
             messages = []
             for turn in summary_turns:
                 messages.extend([turn["user"], turn["assistant"]])
@@ -1076,10 +1155,12 @@ class MemoryManager:
                 to_event_id=compacted_through,
                 turn_count=len(compact_turns),
                 local_date=local_date,
+                session_id=session_id,
             )
             summary_state = {
                 "user_id": user_id,
                 "device_id": device_id,
+                "session_id": session_id,
                 "local_date": local_date,
                 "summary_text": summary,
                 "compacted_through_event_id": compacted_through,
@@ -1089,7 +1170,7 @@ class MemoryManager:
                 "turn_count": len(compact_turns),
                 "created_at": iso_now(),
             }
-            self.redis.set_json(self.redis.summary_key(device_id, user_id), summary_state, self.redis.ttl_seconds)
+            self.redis.set_json(self.redis.summary_key(user_id, device_id, session_id), summary_state, self.redis.ttl_seconds)
             if user_id not in {"anonymous", LEGACY_USER_ID}:
                 self.events.enqueue_job(
                     user_id,
@@ -1107,11 +1188,12 @@ class MemoryManager:
         self,
         user_id: str,
         device_id: str,
+        session_id: str,
         after_event_id: int,
         local_date: str,
         limit: int,
     ) -> list[dict[str, Any]]:
-        turns = self.events.conversation_turns_after(user_id, device_id, after_event_id, 5000)
+        turns = self.events.conversation_turns_after(user_id, device_id, after_event_id, 5000, session_id=session_id)
         filtered = [
             turn
             for turn in turns
@@ -1123,11 +1205,12 @@ class MemoryManager:
         self,
         user_id: str,
         device_id: str,
+        session_id: str,
         through_event_id: int,
         local_date: str,
         limit: int,
     ) -> list[dict[str, Any]]:
-        turns = self.events.conversation_turns_until(user_id, device_id, through_event_id, 5000)
+        turns = self.events.conversation_turns_until(user_id, device_id, through_event_id, 5000, session_id=session_id)
         filtered = [
             turn
             for turn in turns
@@ -1604,7 +1687,7 @@ class MemoryManager:
         device_id = str(job.get("device_id") or "")
         message_events = [
             event
-            for event in self.events.list_events(user_id=user_id, role="user", limit=200, ascending=True)
+            for event in self.events.list_events(user_id=user_id, device_id=device_id or None, role="user", limit=200, ascending=True)
             if from_id < int(event["id"]) <= to_id
         ]
         if not device_id and message_events:
@@ -1621,12 +1704,13 @@ class MemoryManager:
             to_id,
             message_events,
             action_events,
+            session_id=str(message_events[-1].get("session_id") or "") if message_events else None,
         )
         if not preference_context["recent_turns"] and not preference_context["action_events"] and not preference_context.get("rolling_summary"):
             return {"skipped": True, "reason": "no events in extraction range", "from_event_id": from_id, "to_event_id": to_id}
         input_user_events = sum(len(turn["messages"]) for turn in preference_context["recent_turns"])
         input_action_events = len(preference_context["action_events"])
-        existing = self.events.list_preferences(user_id, status=None, limit=100)
+        existing = self.events.list_preferences(user_id, status=None, limit=100, device_id=device_id or None)
         preference_context["existing_preference_count"] = len(existing)
         changed = False
         upserted = 0
@@ -1644,7 +1728,7 @@ class MemoryManager:
                 )
             )
             if pref.action == "revoke":
-                self.events.revoke_preference(user_id, key, pref.value)
+                self.events.revoke_preference(user_id, key, pref.value, device_id=device_id or None)
                 changed = True
                 upserted += 1
                 continue
@@ -1669,13 +1753,14 @@ class MemoryManager:
                 reason_zh=pref.reason_zh,
                 scope=pref.scope,
                 status=status,
+                device_id=device_id or None,
             )
             changed = changed or pref_id is not None
             if pref_id is not None:
                 upserted += 1
                 model_stored += 1
         if changed:
-            self.events.enqueue_job(user_id, "user_card_rebuild")
+            self.events.enqueue_job(user_id, "user_card_rebuild", device_id=device_id or None)
         job_result = {
             "skipped": False,
             "from_event_id": from_id,
@@ -1709,10 +1794,11 @@ class MemoryManager:
         model_preferences = list(result.preferences) if result else []
         model_preference_count = len(model_preferences)
         model_stored = 0
+        device_id = str(preference_context.get("device_id") or "") or None
         for pref in model_preferences:
             key, category = normalize_preference_key(pref.preference_key)
             if pref.action == "revoke":
-                self.events.revoke_preference(user_id, key, pref.value)
+                self.events.revoke_preference(user_id, key, pref.value, device_id=device_id)
                 changed = True
                 upserted += 1
                 continue
@@ -1737,13 +1823,14 @@ class MemoryManager:
                 reason_zh=pref.reason_zh,
                 scope=pref.scope,
                 status=status,
+                device_id=device_id,
             )
             changed = changed or pref_id is not None
             if pref_id is not None:
                 upserted += 1
                 model_stored += 1
         if changed:
-            self.events.enqueue_job(user_id, "user_card_rebuild")
+            self.events.enqueue_job(user_id, "user_card_rebuild", device_id=device_id)
         return {
             "existing_preference_count": len(existing),
             "extracted_preferences": model_preference_count,
@@ -1760,11 +1847,16 @@ class MemoryManager:
         to_event_id: int,
         message_events: list[dict[str, Any]],
         action_events: list[dict[str, Any]],
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        summary = self.events.latest_summary(user_id, device_id) if device_id else None
-        recent_turns = self.events.latest_conversation_turns(user_id, device_id, 5) if device_id else []
+        summary = self.events.latest_summary(user_id, device_id, session_id=session_id) if device_id else None
+        recent_turns = self.events.latest_conversation_turns(user_id, device_id, 5, session_id=session_id) if device_id else []
         summary_to = int((summary or {}).get("to_event_id") or (summary or {}).get("compacted_through_event_id") or 0)
-        evidence_turns = self.events.conversation_turns_until(user_id, device_id, summary_to, 20) if device_id and summary_to else []
+        evidence_turns = (
+            self.events.conversation_turns_until(user_id, device_id, summary_to, 20, session_id=session_id)
+            if device_id and summary_to
+            else []
+        )
         turns = []
         for turn in recent_turns:
             turns.append(
@@ -1811,9 +1903,10 @@ class MemoryManager:
             "context_mode": "summary_plus_recent_turns",
             "user_id": user_id,
             "device_id": device_id,
+            "session_id": session_id,
             "from_event_id": from_event_id,
             "to_event_id": to_event_id,
-            "user_card": self.get_user_card(user_id) or self.restore_user_card(user_id) or {},
+            "user_card": self.get_user_card(user_id, device_id) or self.restore_user_card(user_id, device_id) or {},
             "rolling_summary": (summary or {}).get("summary_text", ""),
             "summary_version": int((summary or {}).get("version", 0) or 0),
             "summary_event_range": {
@@ -1853,7 +1946,12 @@ class MemoryManager:
         }
 
 
-    def _build_user_card(self, user_id: str, preferences: list[dict[str, Any]]) -> dict[str, Any]:
+    def _build_user_card(
+        self,
+        user_id: str,
+        preferences: list[dict[str, Any]],
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
         primary_order = {
             "profile.occupation": 3,
             "preference.likes": 2,
@@ -1872,6 +1970,7 @@ class MemoryManager:
         profile = "，".join(labels)[:600]
         return {
             "user_id": user_id,
+            "device_id": device_id,
             "version": max([int(item.get("revision", 1) or 1) for item in selected] or [1]),
             "profile_text_zh": profile,
             "preferences": [

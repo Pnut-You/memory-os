@@ -46,16 +46,20 @@ class ShortTermMemory:
     def conversation_key(self, device_id: str, user_id: str) -> str:
         return f"{self.prefix}:conversation:{device_id}:{user_id}"
 
-    def session_conversation_key(self, user_id: str, session_id: str) -> str:
-        return f"{self.prefix}:conversation:{user_id}:{session_id}"
+    def session_conversation_key(self, user_id: str, device_id: str, session_id: str) -> str:
+        return f"{self.prefix}:session:{user_id}:{device_id}:{session_id}"
 
     def active_session_key(self, user_id: str, device_id: str) -> str:
         return f"{self.prefix}:active-session:{user_id}:{device_id}"
 
-    def summary_key(self, device_id: str, user_id: str) -> str:
-        return f"{self.prefix}:summary:{device_id}:{user_id}"
+    def summary_key(self, user_id: str, device_id: str, session_id: str | None = None) -> str:
+        if session_id:
+            return f"{self.prefix}:summary:{user_id}:{device_id}:{session_id}"
+        return f"{self.prefix}:summary:{user_id}:{device_id}"
 
-    def user_card_key(self, user_id: str) -> str:
+    def user_card_key(self, user_id: str, device_id: str | None = None) -> str:
+        if device_id:
+            return f"{self.prefix}:user-card:{user_id}:{device_id}"
         return f"{self.prefix}:user-card:{user_id}"
 
     def user_preferences_key(self, user_id: str) -> str:
@@ -97,13 +101,14 @@ class ShortTermMemory:
     def append_session_conversation(
         self,
         user_id: str,
+        device_id: str,
         session_id: str,
         messages: list[dict[str, Any]],
         *,
         ttl_seconds: int | None = None,
         max_items: int = 20,
     ) -> None:
-        key = self.session_conversation_key(user_id, session_id)
+        key = self.session_conversation_key(user_id, device_id, session_id)
         ttl = ttl_seconds or self.ttl_seconds
         if self._redis is not None:
             try:
@@ -131,10 +136,11 @@ class ShortTermMemory:
     def get_session_conversation(
         self,
         user_id: str,
+        device_id: str,
         session_id: str,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        return self._get_list(self.session_conversation_key(user_id, session_id), limit)
+        return self._get_list(self.session_conversation_key(user_id, device_id, session_id), limit)
 
     def _get_list(self, key: str, limit: int | None = None) -> list[dict[str, Any]]:
         if self._redis is not None:
@@ -154,7 +160,7 @@ class ShortTermMemory:
 
     def clear_conversation(self, device_id: str, user_id: str) -> None:
         self.delete_key(self.conversation_key(device_id, user_id))
-        self.delete_key(self.summary_key(device_id, user_id))
+        self.delete_key(self.summary_key(user_id, device_id))
 
     def set_active_session(
         self,
@@ -168,11 +174,17 @@ class ShortTermMemory:
     def get_active_session(self, user_id: str, device_id: str) -> dict[str, Any] | None:
         return self.get_json(self.active_session_key(user_id, device_id))
 
-    def get_context_bundle(self, device_id: str, user_id: str, recent_limit: int) -> dict[str, Any]:
+    def get_context_bundle(
+        self,
+        user_id: str,
+        device_id: str,
+        session_id: str,
+        recent_limit: int,
+    ) -> dict[str, Any]:
         keys = [
-            self.user_card_key(user_id),
-            self.summary_key(device_id, user_id),
-            self.conversation_key(device_id, user_id),
+            self.user_card_key(user_id, device_id),
+            self.summary_key(user_id, device_id, session_id),
+            self.session_conversation_key(user_id, device_id, session_id),
         ]
         if self._redis is not None:
             try:

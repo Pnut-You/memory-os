@@ -240,16 +240,18 @@ def submit_query(payload: QueryRequest, request: Request) -> dict:
 def debug_user(
     request: Request,
     user_id: str = FastAPIPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    device_id: str | None = Query(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
 ) -> dict:
-    return _router_or_503(request).debug_user(user_id)
+    return _router_or_503(request).debug_user(user_id, device_id)
 
 
 @app.get("/api/debug/users/{user_id}/preferences")
 def debug_user_preferences(
     request: Request,
     user_id: str = FastAPIPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    device_id: str | None = Query(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
 ) -> dict:
-    return _router_or_503(request).preferences(user_id)
+    return _router_or_503(request).preferences(user_id, device_id)
 
 
 @app.get("/api/debug/users/{user_id}/sessions")

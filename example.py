@@ -25,10 +25,11 @@ def main() -> None:
             "偏好安静路线",
             [],
             confidence=0.95,
+            device_id="dog-001",
         )
-        memory.rebuild_user_card("user-001")
+        memory.rebuild_user_card("user-001", "dog-001")
         print(memory.get_conversation_context("user-001", "dog-001"))
-        print(memory.search("user-001", "安静"))
+        print(memory.search("user-001", "安静", device_id="dog-001"))
     finally:
         memory.close()
 

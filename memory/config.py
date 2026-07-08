@@ -45,6 +45,9 @@ class MemoryConfig:
     llm_model: str = QWEN_CHAT_MODEL
     summary_every_turns: int = 10
     summary_retain_turns: int = 5
+    short_memory_summary_min_turns: int = 20
+    short_memory_prompt_trigger_tokens: int = 5000
+    short_memory_retain_recent_turns: int = 5
     preference_extractor_enabled: bool = True
     preference_extractor_base_url: str = ""
     preference_extractor_api_key: str = ""
@@ -81,6 +84,27 @@ class MemoryConfig:
             llm_model=os.getenv("LLM_MODEL", QWEN_CHAT_MODEL),
             summary_every_turns=max(1, int(os.getenv("SUMMARY_EVERY_TURNS", "10"))),
             summary_retain_turns=max(1, int(os.getenv("SUMMARY_RETAIN_TURNS", "5"))),
+            short_memory_summary_min_turns=max(
+                1,
+                int(
+                    os.getenv(
+                        "SHORT_MEMORY_SUMMARY_MIN_TURNS",
+                        os.getenv("SUMMARY_EVERY_TURNS", "20"),
+                    )
+                ),
+            ),
+            short_memory_prompt_trigger_tokens=max(
+                1, int(os.getenv("SHORT_MEMORY_PROMPT_TRIGGER_TOKENS", "5000"))
+            ),
+            short_memory_retain_recent_turns=max(
+                1,
+                int(
+                    os.getenv(
+                        "SHORT_MEMORY_RETAIN_RECENT_TURNS",
+                        os.getenv("SUMMARY_RETAIN_TURNS", "5"),
+                    )
+                ),
+            ),
             preference_extractor_enabled=_bool("PREFERENCE_EXTRACTOR_ENABLED", True),
             preference_extractor_base_url=os.getenv("PREFERENCE_EXTRACTOR_BASE_URL")
             or os.getenv("LLM_BASE_URL", QWEN_BASE_URL),
