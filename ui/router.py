@@ -284,7 +284,7 @@ class MemoryDebugRouter:
             limit=500,
             ascending=True,
         )
-        summary = self.manager.events.latest_summary(user_id, device_id)
+        summary = self.manager.events.latest_summary(user_id, device_id, str(session.get("local_date") or ""))
         time_memories = [
             item
             for item in self.manager.events.list_time_memories(user_id, device_id, limit=100)

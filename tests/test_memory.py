@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from memory import MemoryConfig, MemoryManager, ShortTermMemory
 from memory.migrate import migrate_jsonl
-from memory.preferences import PreferenceExtractionResult
+from memory.preferences import ActionPreferenceExtractionResult, PreferenceExtractionResult
 from memory.sqlite_event import LEGACY_USER_ID, SQLiteEventStore
 from ui.app import QueryRequest
 from ui.llm import DebugChatLLM
@@ -57,11 +57,13 @@ class FixedSummarizer:
 
 
 class FakeExtractor:
-    def __init__(self, result: dict | None = None) -> None:
+    def __init__(self, result: dict | None = None, action_result: dict | None = None) -> None:
         self.calls = []
+        self.action_calls = []
         self.model = "fake-70b"
         self.prompt_version = "test-v1"
         self._result = result or {"schema_version": "1.0", "user_id": "user-001", "preferences": []}
+        self._action_result = action_result or {"schema_version": "1.0", "user_id": "user-001", "memories": []}
 
     def status(self):
         return {"enabled": True, "configured": True, "model": self.model}
@@ -71,6 +73,16 @@ class FakeExtractor:
         data = dict(self._result)
         data["user_id"] = user_id
         return PreferenceExtractionResult.model_validate(data)
+
+    @property
+    def configured(self):
+        return True
+
+    def extract_action_preferences(self, user_id, action_memory_context):
+        self.action_calls.append({"user_id": user_id, "action_memory_context": action_memory_context})
+        data = dict(self._action_result)
+        data["user_id"] = user_id
+        return ActionPreferenceExtractionResult.model_validate(data)
 
 
 class FailingExtractor(FakeExtractor):
@@ -996,6 +1008,49 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_short_summary_is_scoped_by_local_date(self):
+        manager = self.make_manager()
+        capture = CaptureSummarizer()
+        manager.summarizer = capture
+        try:
+            for i in range(10):
+                manager.add_conversation_turn(
+                    f"day1-{i}",
+                    "u",
+                    "d",
+                    f"第一天问题{i}",
+                    f"第一天回答{i}",
+                    timestamp=f"2026-07-02T09:00:{i:02d}+08:00",
+                )
+            self.assertTrue(manager.wait_for_summaries())
+            first = manager.events.latest_summary("u", "d", "2026-07-02")
+            self.assertIsNotNone(first)
+            self.assertEqual(first["local_date"], "2026-07-02")
+            self.assertEqual(first["version"], 1)
+
+            for i in range(10):
+                manager.add_conversation_turn(
+                    f"day2-{i}",
+                    "u",
+                    "d",
+                    f"第二天问题{i}",
+                    f"第二天回答{i}",
+                    timestamp=f"2026-07-03T09:00:{i:02d}+08:00",
+                )
+            self.assertTrue(manager.wait_for_summaries())
+            second = manager.events.latest_summary("u", "d", "2026-07-03")
+            self.assertIsNotNone(second)
+            self.assertEqual(second["local_date"], "2026-07-03")
+            self.assertEqual(second["version"], 1)
+            self.assertNotEqual(first["id"], second["id"])
+            self.assertTrue(all("第二天" in item["content"] for item in capture.calls[-1]["messages"]))
+            ctx = manager.get_conversation_context("u", "d", timestamp="2026-07-03T09:00:20+08:00")
+            self.assertEqual(ctx["summary_version"], 1)
+            self.assertEqual(ctx["rolling_summary"], second["summary_text"])
+            self.assertNotEqual(ctx["rolling_summary"], first["summary_text"])
+        finally:
+            manager.close()
+
     def test_local_summary_has_hard_length_limit(self):
         manager = self.make_manager()
         try:
@@ -1335,7 +1390,7 @@ class MemorySystemTests(unittest.TestCase):
             self.assertIn("daily_extraction", result)
             self.assertEqual(manager.events.list_time_memories("user-001", "dog-001"), [])
             process = manager.process_memory_jobs_once(limit=2, include_daily=True)
-            self.assertEqual(process["succeeded"], 2)
+            self.assertEqual(process["succeeded"], 1)
             memories = manager.events.list_time_memories("user-001", "dog-001")
             self.assertEqual(len(memories), 1)
             self.assertEqual(memories[0]["payload_json"]["memory_date"], "2026-07-02")
@@ -1359,10 +1414,31 @@ class MemorySystemTests(unittest.TestCase):
             manager.process_memory_jobs_once(limit=2, include_daily=True)
             manager.summarizer = FixedSummarizer("第二版总结")
             result = manager.trigger_daily_extraction("user-001", "dog-001", "2026-07-02")
-            self.assertEqual(result["process"]["succeeded"], 2)
+            self.assertEqual(result["process"]["succeeded"], 1)
             memories = manager.events.list_time_memories("user-001", "dog-001")
             self.assertEqual(len(memories), 1)
             self.assertIn("第二版总结", memories[0]["content"])
+        finally:
+            manager.close()
+
+    def test_daily_time_memory_local_fallback_is_not_full_transcript(self):
+        manager = self.make_manager()
+        try:
+            manager.add_conversation_turn(
+                "daily-local-summary",
+                "user-001",
+                "dog-001",
+                "今天先巡检客厅，然后提醒我检查门窗",
+                "这是助手逐句回复，应该不要作为时间记忆原样保存",
+                timestamp="2026-07-02T09:00:00+08:00",
+            )
+            result = manager.trigger_daily_extraction("user-001", "dog-001", "2026-07-02")
+            self.assertEqual(result["process"]["succeeded"], 1)
+            memory = manager.events.list_time_memories("user-001", "dog-001")[0]
+            self.assertIn("日期总结", memory["content"])
+            self.assertIn("巡检客厅", memory["content"])
+            self.assertNotIn("助手逐句回复", memory["content"])
+            self.assertEqual(memory["payload_json"]["metadata"]["summary_backend"], "local")
         finally:
             manager.close()
 
@@ -1389,16 +1465,87 @@ class MemorySystemTests(unittest.TestCase):
                         }
                     ],
                 )
-            process = manager.process_memory_jobs_once(limit=4, include_daily=True)
-            self.assertEqual(process["succeeded"], 2)
+            result = manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
+            self.assertEqual(result["process"]["succeeded"], 1)
             memories = manager.events.list_action_memories("user-001", "dog-001", memory_date="2026-07-02")
-            self.assertEqual(len(memories), 2)
+            self.assertEqual(len(memories), 1)
             self.assertEqual(memories[0]["event_type"], "action_memory")
             self.assertEqual(memories[0]["payload_json"]["memory_date"], "2026-07-02")
-            self.assertEqual(
-                [item["code"] for item in memories[0]["payload_json"]["actions"]],
-                ["forward", "sit"],
+            self.assertEqual(memories[0]["payload_json"]["metadata"]["action_chain_count"], 2)
+            self.assertIn("1. 用户要求 往前走 -> 坐下", memories[0]["content"])
+            self.assertIn("2. 用户要求 往前走 -> 坐下", memories[0]["content"])
+        finally:
+            manager.close()
+
+    def test_daily_event_button_extracts_from_day_conversation_without_action_route(self):
+        manager = self.make_manager()
+        try:
+            manager.add_conversation_turn(
+                "daily-event-from-text",
+                "user-001",
+                "dog-001",
+                "请你坐下，然后转圈",
+                "好的，我坐下后转圈。",
+                timestamp="2026-07-02T09:00:00+08:00",
             )
+            self.assertEqual(manager.events.list_action_memories("user-001", "dog-001"), [])
+            result = manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
+            self.assertEqual(result["process"]["succeeded"], 1)
+            self.assertEqual(result["event_memory_count"], 1)
+            memory = manager.events.list_action_memories("user-001", "dog-001", memory_date="2026-07-02")[0]
+            self.assertIn("请你坐下", memory["content"])
+            self.assertEqual(memory["payload_json"]["metadata"]["extract_backend"], "local")
+        finally:
+            manager.close()
+
+    def test_daily_action_memory_rerun_replaces_single_day_text(self):
+        manager = self.make_manager()
+        try:
+            manager.add_conversation_turn(
+                "daily-action-replace-1",
+                "user-001",
+                "dog-001",
+                "坐下",
+                "好的",
+                timestamp="2026-07-02T09:00:00+08:00",
+                model_event_routes=[
+                    {
+                        "type": "action_sequence",
+                        "decision": "create",
+                        "confidence": 0.9,
+                        "actions": [{"code": "sit", "label_zh": "坐下"}],
+                    }
+                ],
+            )
+            manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
+            first = manager.events.list_action_memories("user-001", "dog-001", memory_date="2026-07-02")
+            self.assertEqual(len(first), 1)
+            self.assertIn("坐下", first[0]["content"])
+
+            manager.add_conversation_turn(
+                "daily-action-replace-2",
+                "user-001",
+                "dog-001",
+                "转圈",
+                "好的",
+                timestamp="2026-07-02T09:00:05+08:00",
+                session_id=first[0]["payload_json"]["metadata"]["session_ids"][0],
+                model_event_routes=[
+                    {
+                        "type": "action_sequence",
+                        "decision": "create",
+                        "confidence": 0.9,
+                        "actions": [{"code": "spin", "label_zh": "转圈"}],
+                    }
+                ],
+            )
+            result = manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
+            self.assertEqual(result["event_memory_count"], 1)
+            replaced = manager.events.list_action_memories("user-001", "dog-001", memory_date="2026-07-02")
+            self.assertEqual(len(replaced), 1)
+            self.assertIn("坐下", replaced[0]["content"])
+            self.assertIn("转圈", replaced[0]["content"])
+            self.assertEqual(replaced[0]["payload_json"]["metadata"]["action_chain_count"], 2)
         finally:
             manager.close()
 
@@ -1421,7 +1568,7 @@ class MemorySystemTests(unittest.TestCase):
                     }
                 ],
             )
-            manager.process_memory_jobs_once(limit=2, include_daily=True)
+            manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
             memories = manager.events.list_action_memories("user-001", "dog-001", memory_date="2026-07-02")
             self.assertEqual(len(memories), 1)
             self.assertEqual(memories[0]["event_type"], "action_memory")
@@ -1452,7 +1599,7 @@ class MemorySystemTests(unittest.TestCase):
                     }
                 ],
             )
-            manager.process_memory_jobs_once(limit=2, include_daily=True)
+            manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
             texts = router.event_texts(
                 "user-001",
                 "dog-001",
@@ -1486,7 +1633,7 @@ class MemorySystemTests(unittest.TestCase):
                     }
                 ],
             )
-            manager.process_memory_jobs_once(limit=2, include_daily=True)
+            manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
             self.assertEqual(len(router.event_texts("user-001", "dog-001", "action_memory", None, None)["memories"]), 1)
             texts = router.event_texts("user-001", "dog-001", "message", None, None)["memories"]
             self.assertEqual(texts, [])
@@ -1559,7 +1706,7 @@ class MemorySystemTests(unittest.TestCase):
                 ],
             )
             self.assertIn("action_feedback_event_id", result)
-            manager.process_memory_jobs_once(limit=2, include_daily=True)
+            manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
             memories = manager.events.list_action_memories("user-001", "dog-001", memory_date="2026-07-02")
             self.assertEqual(len(memories), 1)
             self.assertIn("事件记忆", memories[0]["content"])
@@ -1594,7 +1741,7 @@ class MemorySystemTests(unittest.TestCase):
                 ],
             )
             self.assertNotIn("action_feedback_event_id", result)
-            manager.process_memory_jobs_once(limit=2, include_daily=True)
+            manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
             memories = manager.events.list_action_memories("user-001", "dog-001", memory_date="2026-07-02")
             self.assertEqual(memories, [])
         finally:
@@ -1636,7 +1783,7 @@ class MemorySystemTests(unittest.TestCase):
                 ],
             )
             self.assertNotIn("action_feedback_event_id", result)
-            manager.process_memory_jobs_once(limit=2, include_daily=True)
+            manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
             memories = manager.events.list_action_memories("user-001", "dog-001", memory_date="2026-07-02")
             self.assertEqual(len(memories), 1)
             self.assertNotIn("用户表示肯定", memories[0]["content"])
@@ -1707,6 +1854,21 @@ class MemorySystemTests(unittest.TestCase):
 
     def test_weekly_action_memories_create_action_preference_memory_not_longterm_pref(self):
         manager = self.make_manager()
+        manager.preference_extractor = FakeExtractor(
+            action_result={
+                "schema_version": "1.0",
+                "user_id": "user-001",
+                "memories": [
+                    {
+                        "content": "七天动作偏好记忆（2026-06-30 至 2026-07-02）：用户多次要求回家先开灯再播放新闻。",
+                        "title": "回家动作偏好",
+                        "confidence": 0.91,
+                        "source_event_ids": [1, 2],
+                        "reason_zh": "七天内多次出现同类动作链路",
+                    }
+                ],
+            }
+        )
         try:
             for idx, day in enumerate(("2026-06-30", "2026-07-02"), start=1):
                 manager.add_conversation_turn(
@@ -1728,7 +1890,7 @@ class MemorySystemTests(unittest.TestCase):
                         }
                     ],
                 )
-                manager.process_memory_jobs_once(limit=2, include_daily=True)
+                manager.trigger_daily_event_extraction("user-001", "dog-001", day)
             manager.add_conversation_turn(
                 "weekly-non-repeat",
                 "user-001",
@@ -1745,7 +1907,7 @@ class MemorySystemTests(unittest.TestCase):
                     }
                 ],
             )
-            manager.process_memory_jobs_once(limit=2, include_daily=True)
+            manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-01")
             self.assertEqual(len(manager.events.list_action_memories("user-001", "dog-001")), 3)
             result = manager.trigger_weekly_action_preference_extraction(
                 "user-001",
@@ -1756,13 +1918,44 @@ class MemorySystemTests(unittest.TestCase):
             self.assertEqual(result["process"]["claimed"], 1)
             self.assertEqual(result["process"]["succeeded"], 1)
             self.assertEqual(result["process"]["jobs"][0]["stored_action_preference_memories"], 1)
+            self.assertEqual(len(manager.preference_extractor.action_calls), 1)
+            context = manager.preference_extractor.action_calls[0]["action_memory_context"]
+            self.assertEqual(context["context_mode"], "seven_day_action_memory_text")
+            self.assertIn("事件记忆（2026-06-30）", context["combined_text"])
             prefs = manager.events.list_preferences("user-001", status=None)
             self.assertEqual(prefs, [])
             action_prefs = manager.events.list_action_preference_memories("user-001", "dog-001", end_date="2026-07-02")
             self.assertEqual(len(action_prefs), 1)
             self.assertEqual(action_prefs[0]["event_type"], "action_preference_memory")
-            self.assertIn("开灯 -> 播放新闻", action_prefs[0]["content"])
-            self.assertIn("出现 2 天", action_prefs[0]["content"])
+            self.assertIn("多次要求回家先开灯再播放新闻", action_prefs[0]["content"])
+        finally:
+            manager.close()
+
+    def test_weekly_action_preference_skips_when_model_returns_empty(self):
+        manager = self.make_manager()
+        manager.preference_extractor = FakeExtractor()
+        try:
+            manager.add_conversation_turn(
+                "weekly-empty-model",
+                "user-001",
+                "dog-001",
+                "坐下",
+                "好的",
+                timestamp="2026-07-02T09:00:00+08:00",
+                model_event_routes=[
+                    {
+                        "type": "action_sequence",
+                        "decision": "create",
+                        "confidence": 0.9,
+                        "actions": [{"code": "sit", "label_zh": "坐下"}],
+                    }
+                ],
+            )
+            manager.trigger_daily_event_extraction("user-001", "dog-001", "2026-07-02")
+            result = manager.trigger_weekly_action_preference_extraction("user-001", "dog-001", "2026-07-02")
+            self.assertEqual(result["process"]["skipped"], 1)
+            self.assertEqual(result["process"]["jobs"][0]["model_extracted_memories"], 0)
+            self.assertEqual(manager.events.list_action_preference_memories("user-001", "dog-001"), [])
         finally:
             manager.close()
 
@@ -1856,7 +2049,7 @@ class MemorySystemTests(unittest.TestCase):
                     }
                 ],
             )
-            router.extract_daily_memory("u", "d", memory_date)
+            router.extract_daily_events("u", "d", memory_date)
             self.assertIn("user_card", router.debug_user("u"))
             self.assertEqual(len(router.time_memories("u", "d")["time_memories"]), 1)
             self.assertEqual(len(router.action_events("u", "d")["actions"]), 1)

@@ -154,6 +154,75 @@ class PreferenceExtractionResult:
         return cls.model_validate(json.loads(_json_text(value)), default_user_id=default_user_id)
 
 
+@dataclass(slots=True)
+class ExtractedActionPreferenceMemory:
+    content: str
+    title: str = ""
+    confidence: float = 0.5
+    source_event_ids: list[int] = field(default_factory=list)
+    reason_zh: str = ""
+
+    def model_dump(self) -> dict[str, Any]:
+        return {
+            "content": self.content,
+            "title": self.title,
+            "confidence": self.confidence,
+            "source_event_ids": list(self.source_event_ids),
+            "reason_zh": self.reason_zh,
+        }
+
+
+@dataclass(slots=True)
+class ActionPreferenceExtractionResult:
+    schema_version: str
+    user_id: str
+    memories: list[ExtractedActionPreferenceMemory] = field(default_factory=list)
+
+    @classmethod
+    def model_validate(cls, value: dict[str, Any], default_user_id: str = "") -> "ActionPreferenceExtractionResult":
+        if isinstance(value, list):
+            value = {"schema_version": "1.0", "user_id": default_user_id, "memories": value}
+        if isinstance(value, dict) and "memories" not in value and "content" in value:
+            value = {"schema_version": "1.0", "user_id": default_user_id, "memories": [value]}
+        if not isinstance(value, dict):
+            raise ValueError("action preference extractor output must be an object")
+        if default_user_id and not value.get("user_id"):
+            value = {**value, "user_id": default_user_id}
+        user_id = str(value.get("user_id") or "")
+        if not user_id:
+            raise ValueError("user_id is required")
+        memories = []
+        for raw in value.get("memories") or []:
+            if not isinstance(raw, dict):
+                raise ValueError("memory item must be an object")
+            content = str(raw.get("content") or "").strip()
+            if not content:
+                raise ValueError("content is required")
+            confidence = float(raw.get("confidence", 0.5))
+            if not 0 <= confidence <= 1:
+                raise ValueError("confidence must be in [0,1]")
+            source_event_ids = []
+            for event_id in raw.get("source_event_ids") or []:
+                try:
+                    source_event_ids.append(int(event_id))
+                except (TypeError, ValueError):
+                    continue
+            memories.append(
+                ExtractedActionPreferenceMemory(
+                    content=content,
+                    title=str(raw.get("title") or ""),
+                    confidence=confidence,
+                    source_event_ids=source_event_ids,
+                    reason_zh=str(raw.get("reason_zh") or ""),
+                )
+            )
+        return cls(str(value.get("schema_version") or "1.0"), user_id, memories)
+
+    @classmethod
+    def model_validate_json(cls, value: str, default_user_id: str = "") -> "ActionPreferenceExtractionResult":
+        return cls.model_validate(json.loads(_json_text(value)), default_user_id=default_user_id)
+
+
 def _json_text(value: str) -> str:
     text = value.strip()
     if text.startswith("```"):
@@ -303,6 +372,84 @@ class PreferenceExtractor:
             raise RuntimeError(f"preference extraction http {exc.code}: {body}") from exc
         except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError(f"preference extraction failed: {exc}") from exc
+
+    def extract_action_preferences(
+        self,
+        user_id: str,
+        action_memory_context: dict[str, Any],
+    ) -> ActionPreferenceExtractionResult:
+        if not self.configured:
+            return ActionPreferenceExtractionResult(schema_version="1.0", user_id=user_id, memories=[])
+        payload = {
+            "model": self.model,
+            "temperature": 0.1,
+            "max_tokens": 1600,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是机器狗 Memory OS 的动作事件偏好抽取器。只输出严格 JSON，不要 Markdown。"
+                        "输入是最近七天按天聚合的动作事件记忆 text。"
+                        "只抽取反复出现、稳定、有未来复用价值的动作链路偏好。"
+                        "单次出现、普通闲聊、时间总结、非机器狗动作不要输出。"
+                        "输出写入事件偏好记忆，不是用户结构化长期偏好。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "user_id": user_id,
+                            "action_memory_context": action_memory_context,
+                            "output_schema": {
+                                "schema_version": "1.0",
+                                "user_id": user_id,
+                                "memories": [
+                                    {
+                                        "content": "七天动作偏好记忆文本，说明稳定动作链路和证据",
+                                        "title": "可选标题",
+                                        "confidence": "0-1",
+                                        "source_event_ids": [1, 2],
+                                        "reason_zh": "为什么这是稳定动作偏好",
+                                    }
+                                ],
+                            },
+                            "rules": [
+                                "顶层必须是对象，包含 schema_version、user_id、memories。",
+                                "memories 必须是数组；没有稳定动作偏好时返回空数组。",
+                                "source_event_ids 只能引用 action_memory_context.action_memories 中真实 event_id。",
+                                "content 必须是中文自然文本，可直接作为事件库 text 展示。",
+                                "不要输出 Markdown，不要解释。",
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            content = data["choices"][0]["message"]["content"]
+            try:
+                return ActionPreferenceExtractionResult.model_validate_json(content, default_user_id=user_id)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"action preference extraction validation failed: {exc}; response={content[:500]}"
+                ) from exc
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"action preference extraction http {exc.code}: {body}") from exc
+        except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"action preference extraction failed: {exc}") from exc
 
 
 def should_schedule_preference(text: str) -> bool:
