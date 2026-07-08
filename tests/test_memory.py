@@ -162,7 +162,7 @@ class MemorySystemTests(unittest.TestCase):
         with self.assertRaises(Exception):
             QueryRequest(user_id="bad id", device_id="dog-1", query="你好")
 
-    def test_same_user_shares_user_card_across_devices(self):
+    def test_same_user_card_is_scoped_by_device(self):
         manager = self.make_manager()
         try:
             manager.events.upsert_preference(
@@ -173,12 +173,13 @@ class MemorySystemTests(unittest.TestCase):
                 "偏好安静路线",
                 [],
                 confidence=0.95,
+                device_id="dog-1",
             )
-            manager.rebuild_user_card("user-001")
+            manager.rebuild_user_card("user-001", "dog-1")
             dog1 = manager.get_conversation_context("user-001", "dog-1")
             dog2 = manager.get_conversation_context("user-001", "dog-2")
             self.assertEqual(dog1["user_card"]["preferences"][0]["key"], "navigation.noise_level")
-            self.assertEqual(dog1["user_card"], dog2["user_card"])
+            self.assertIsNone(dog2["user_card"])
         finally:
             manager.close()
 
@@ -215,8 +216,79 @@ class MemorySystemTests(unittest.TestCase):
                 timestamp="2026-07-02T09:00:16+08:00",
             )
             self.assertNotEqual(first["session_id"], second["session_id"])
-            self.assertEqual(manager.redis.get_session_conversation("u1", first["session_id"])[0]["content"], "a")
-            self.assertEqual(manager.redis.get_session_conversation("u1", second["session_id"])[0]["content"], "c")
+            self.assertEqual(manager.redis.get_session_conversation("u1", "dog-1", first["session_id"])[0]["content"], "a")
+            self.assertEqual(manager.redis.get_session_conversation("u1", "dog-1", second["session_id"])[0]["content"], "c")
+        finally:
+            manager.close()
+
+    def test_short_term_memory_does_not_cross_devices(self):
+        manager = self.make_manager()
+        try:
+            first = manager.add_conversation_turn("dog1-r1", "user-001", "dog-001", "dog-001 的短期消息", "收到")
+            second = manager.add_conversation_turn("dog2-r1", "user-001", "dog-002", "dog-002 的短期消息", "收到")
+            dog1_cached = manager.redis.get_session_conversation("user-001", "dog-001", first["session_id"])
+            dog2_cached = manager.redis.get_session_conversation("user-001", "dog-002", second["session_id"])
+            self.assertTrue(any("dog-001" in item["content"] for item in dog1_cached))
+            self.assertTrue(any("dog-002" in item["content"] for item in dog2_cached))
+            self.assertEqual(manager.redis.get_session_conversation("user-001", "dog-002", first["session_id"]), [])
+        finally:
+            manager.close()
+
+    def test_long_term_preferences_do_not_cross_devices(self):
+        manager = self.make_manager()
+        try:
+            manager.events.upsert_preference(
+                "user-001",
+                "preference.likes",
+                "preference",
+                {"type": "string", "code": "frisbee", "label_zh": "飞盘"},
+                "喜欢飞盘",
+                [],
+                confidence=0.95,
+                device_id="dog-001",
+            )
+            manager.rebuild_user_card("user-001", "dog-001")
+            self.assertEqual(len(manager.events.list_preferences("user-001", status="active", device_id="dog-001")), 1)
+            self.assertEqual(manager.events.list_preferences("user-001", status="active", device_id="dog-002"), [])
+            self.assertIsNotNone(manager.get_user_card("user-001", "dog-001"))
+            self.assertIsNone(manager.get_user_card("user-001", "dog-002"))
+        finally:
+            manager.close()
+
+    def test_debug_user_long_term_memory_filters_by_device(self):
+        manager = self.make_manager()
+        router = MemoryDebugRouter(manager, FakeLLM())
+        try:
+            manager.events.upsert_preference(
+                "user-001",
+                "preference.likes",
+                "preference",
+                {"type": "string", "code": "frisbee", "label_zh": "飞盘"},
+                "喜欢飞盘",
+                [],
+                confidence=0.95,
+                device_id="dog-001",
+            )
+            manager.events.upsert_preference(
+                "user-001",
+                "preference.likes",
+                "preference",
+                {"type": "string", "code": "apple", "label_zh": "苹果"},
+                "喜欢苹果",
+                [],
+                confidence=0.95,
+                device_id="dog-002",
+            )
+            manager.rebuild_user_card("user-001", "dog-001")
+            manager.rebuild_user_card("user-001", "dog-002")
+
+            dog1 = router.debug_user("user-001", "dog-001")
+            dog2 = router.debug_user("user-001", "dog-002")
+
+            self.assertEqual([item["display_text_zh"] for item in dog1["active_preferences"]], ["喜欢飞盘"])
+            self.assertEqual([item["display_text_zh"] for item in dog2["active_preferences"]], ["喜欢苹果"])
+            self.assertEqual(dog1["user_card"]["device_id"], "dog-001")
+            self.assertEqual(dog2["user_card"]["device_id"], "dog-002")
         finally:
             manager.close()
 
@@ -313,9 +385,9 @@ class MemorySystemTests(unittest.TestCase):
             manager.add_conversation_turn("r1", "user-001", "dog-1", "记住我喜欢安静路线", "好")
             self.assertEqual(manager.process_memory_jobs_once()["succeeded"], 1)
             self.assertEqual(manager.process_memory_jobs_once()["succeeded"], 1)
-            prefs = manager.events.list_preferences("user-001", status="active")
+            prefs = manager.events.list_preferences("user-001", status="active", device_id="dog-1")
             self.assertEqual(prefs[0]["preference_key"], "navigation.noise_level")
-            self.assertIsNotNone(manager.get_user_card("user-001"))
+            self.assertIsNotNone(manager.get_user_card("user-001", "dog-1"))
         finally:
             manager.close()
 
@@ -412,7 +484,7 @@ class MemorySystemTests(unittest.TestCase):
             self.assertIn("profile.occupation", keys)
             self.assertIn("preference.likes", keys)
             self.assertIn("preference.dislikes", keys)
-            card_keys = [item["key"] for item in manager.get_user_card("user-001")["preferences"]]
+            card_keys = [item["key"] for item in manager.get_user_card("user-001", "dog-001")["preferences"]]
             self.assertIn("profile.occupation", card_keys)
         finally:
             manager.close()
@@ -458,9 +530,16 @@ class MemorySystemTests(unittest.TestCase):
         manager.summarizer = CaptureSummarizer()
         manager.preference_extractor = FakeExtractor()
         try:
-            for i in range(10):
+            for i in range(20):
                 text = "我喜欢安静路线" if i == 0 else f"普通消息{i}"
-                manager.add_conversation_turn(f"r{i}", "user-001", "dog-001", text, "好")
+                manager.add_conversation_turn(
+                    f"r{i}",
+                    "user-001",
+                    "dog-001",
+                    text,
+                    "好",
+                    prompt_token_count=6000,
+                )
             self.assertTrue(manager.wait_for_summaries())
             result = manager.trigger_preference_extraction("user-001", "dog-001", force_recent=True)
             self.assertEqual(result["process"]["succeeded"], 1)
@@ -472,7 +551,7 @@ class MemorySystemTests(unittest.TestCase):
                 for turn in context["recent_turns"]
                 for message in turn["messages"]
             ]
-            self.assertIn("普通消息9", texts)
+            self.assertIn("普通消息19", texts)
         finally:
             manager.close()
 
@@ -926,11 +1005,20 @@ class MemorySystemTests(unittest.TestCase):
     def test_redis_loss_restores_user_card_and_recent_context(self):
         manager = self.make_manager()
         try:
-            manager.events.upsert_preference("u", "interaction.language", "interaction", {"type": "enum", "code": "zh"}, "默认中文", [], confidence=0.95)
-            manager.rebuild_user_card("u")
+            manager.events.upsert_preference(
+                "u",
+                "interaction.language",
+                "interaction",
+                {"type": "enum", "code": "zh"},
+                "默认中文",
+                [],
+                confidence=0.95,
+                device_id="d",
+            )
+            manager.rebuild_user_card("u", "d")
             for i in range(3):
                 manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}")
-            manager.redis.delete_key(manager.redis.user_card_key("u"))
+            manager.redis.delete_key(manager.redis.user_card_key("u", "d"))
             manager.redis.clear_conversation("d", "u")
             ctx = manager.get_conversation_context("u", "d")
             self.assertEqual(ctx["user_card"]["preferences"][0]["key"], "interaction.language")
@@ -943,68 +1031,79 @@ class MemorySystemTests(unittest.TestCase):
         blocker = BlockingSummarizer()
         manager.summarizer = blocker
         try:
-            for i in range(9):
-                manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}")
+            for i in range(19):
+                manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}", prompt_token_count=6000)
             started = time.perf_counter()
-            manager.add_conversation_turn("r9", "u", "d", "问题9", "回答9")
+            manager.add_conversation_turn("r19", "u", "d", "问题19", "回答19", prompt_token_count=6000)
             self.assertLess(time.perf_counter() - started, 0.5)
             self.assertTrue(blocker.started.wait(1))
         finally:
             blocker.release.set()
             manager.close()
 
-    def test_summary_compacts_first_five_after_ten_and_next_five_after_fifteen(self):
+    def test_short_summary_skips_when_twenty_turns_but_prompt_under_threshold(self):
         manager = self.make_manager()
         capture = CaptureSummarizer()
         manager.summarizer = capture
         try:
-            for i in range(9):
-                manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}")
-            manager.wait_for_summaries()
+            for i in range(20):
+                manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}", prompt_token_count=4999)
+            self.assertTrue(manager.wait_for_summaries())
             self.assertIsNone(manager.events.latest_summary("u", "d"))
+            self.assertEqual(capture.calls, [])
+            events = manager.events.list_events(user_id="u", device_id="d", event_type="message", limit=100)
+            self.assertTrue(any(item["content"] == "问题0" for item in events))
+        finally:
+            manager.close()
 
-            manager.add_conversation_turn("r9", "u", "d", "问题9", "回答9")
+    def test_short_summary_skips_when_under_twenty_turns_even_if_prompt_large(self):
+        manager = self.make_manager()
+        capture = CaptureSummarizer()
+        manager.summarizer = capture
+        try:
+            for i in range(19):
+                manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}", prompt_token_count=6000)
+            self.assertTrue(manager.wait_for_summaries())
+            self.assertIsNone(manager.events.latest_summary("u", "d"))
+            self.assertEqual(capture.calls, [])
+        finally:
+            manager.close()
+
+    def test_short_summary_compacts_old_conversation_and_keeps_recent_five_turns(self):
+        manager = self.make_manager()
+        capture = CaptureSummarizer()
+        manager.summarizer = capture
+        try:
+            for i in range(20):
+                manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}", prompt_token_count=6000)
             self.assertTrue(manager.wait_for_summaries())
             first = manager.events.latest_summary("u", "d")
             self.assertEqual(first["version"], 1)
             self.assertEqual(first["from_event_id"], 1)
-            self.assertEqual(first["to_event_id"], 10)
-            self.assertEqual(first["compacted_through_event_id"], 10)
-            self.assertEqual(first["turn_count"], 5)
-            self.assertEqual([item["id"] for item in capture.calls[0]["messages"]], list(range(1, 11)))
+            self.assertEqual(first["to_event_id"], 30)
+            self.assertEqual(first["compacted_through_event_id"], 30)
+            self.assertEqual(first["turn_count"], 15)
+            self.assertEqual([item["id"] for item in capture.calls[0]["messages"]], list(range(1, 31)))
             ctx = manager.get_conversation_context("u", "d")
-            self.assertEqual(ctx["recent_messages"][0]["id"], 11)
-            self.assertEqual(ctx["recent_messages"][-1]["id"], 20)
-
-            for i in range(10, 15):
-                manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}")
-            self.assertTrue(manager.wait_for_summaries())
-            second = manager.events.latest_summary("u", "d")
-            self.assertEqual(second["version"], 2)
-            self.assertEqual(second["from_event_id"], 11)
-            self.assertEqual(second["to_event_id"], 20)
-            self.assertEqual(second["compacted_through_event_id"], 20)
-            self.assertEqual(second["turn_count"], 5)
-            self.assertEqual([item["id"] for item in capture.calls[1]["messages"]], list(range(1, 21)))
-            ctx = manager.get_conversation_context("u", "d")
-            self.assertEqual(ctx["recent_messages"][0]["id"], 21)
-            self.assertEqual(ctx["recent_messages"][-1]["id"], 30)
+            self.assertEqual(ctx["recent_messages"][0]["id"], 31)
+            self.assertEqual(ctx["recent_messages"][-1]["id"], 40)
+            self.assertTrue(all(f"问题{i}" in [item["content"] for item in ctx["recent_messages"]] for i in range(15, 20)))
         finally:
             manager.close()
 
-    def test_summary_rewrites_bounded_twenty_turn_window(self):
+    def test_summary_does_not_keep_compacting_without_twenty_new_turns(self):
         manager = self.make_manager()
         capture = CaptureSummarizer()
         manager.summarizer = capture
         try:
             for i in range(30):
-                manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}")
-                manager.wait_for_summaries()
-            self.assertGreaterEqual(len(capture.calls), 5)
+                manager.add_conversation_turn(f"r{i}", "u", "d", f"问题{i}", f"回答{i}", prompt_token_count=6000)
+            manager.wait_for_summaries()
+            self.assertEqual(len(capture.calls), 1)
             last_ids = [item["id"] for item in capture.calls[-1]["messages"]]
-            self.assertEqual(last_ids[0], 11)
-            self.assertEqual(last_ids[-1], 50)
-            self.assertNotIn(1, last_ids)
+            self.assertEqual(last_ids[0], 1)
+            self.assertLessEqual(last_ids[-1], 50)
+            self.assertTrue(all(item["role"] in {"user", "assistant"} for item in capture.calls[-1]["messages"]))
         finally:
             manager.close()
 
@@ -1013,7 +1112,7 @@ class MemorySystemTests(unittest.TestCase):
         capture = CaptureSummarizer()
         manager.summarizer = capture
         try:
-            for i in range(10):
+            for i in range(20):
                 manager.add_conversation_turn(
                     f"day1-{i}",
                     "u",
@@ -1021,6 +1120,7 @@ class MemorySystemTests(unittest.TestCase):
                     f"第一天问题{i}",
                     f"第一天回答{i}",
                     timestamp=f"2026-07-02T09:00:{i:02d}+08:00",
+                    prompt_token_count=6000,
                 )
             self.assertTrue(manager.wait_for_summaries())
             first = manager.events.latest_summary("u", "d", "2026-07-02")
@@ -1028,7 +1128,7 @@ class MemorySystemTests(unittest.TestCase):
             self.assertEqual(first["local_date"], "2026-07-02")
             self.assertEqual(first["version"], 1)
 
-            for i in range(10):
+            for i in range(20):
                 manager.add_conversation_turn(
                     f"day2-{i}",
                     "u",
@@ -1036,6 +1136,7 @@ class MemorySystemTests(unittest.TestCase):
                     f"第二天问题{i}",
                     f"第二天回答{i}",
                     timestamp=f"2026-07-03T09:00:{i:02d}+08:00",
+                    prompt_token_count=6000,
                 )
             self.assertTrue(manager.wait_for_summaries())
             second = manager.events.latest_summary("u", "d", "2026-07-03")
@@ -1061,11 +1162,12 @@ class MemorySystemTests(unittest.TestCase):
                     "d",
                     f"问题{i}" + "很长的内容" * 80,
                     f"回答{i}" + "很长的回复" * 80,
+                    prompt_token_count=6000,
                 )
                 manager.wait_for_summaries()
             latest = manager.events.latest_summary("u", "d")
             self.assertLessEqual(len(latest["summary_text"]), 1600)
-            self.assertNotIn("问题0", latest["summary_text"])
+            self.assertIn("日期总结", latest["summary_text"])
         finally:
             manager.close()
 
@@ -1075,9 +1177,9 @@ class MemorySystemTests(unittest.TestCase):
             for i in range(12):
                 manager.add_conversation_turn(f"r{i}", "u", "d", f"完整问题{i}", f"完整回答{i}")
             session_id = manager.events.list_sessions("u", "d")[0]["session_id"]
-            cached = manager.redis.get_session_conversation("u", session_id)
-            self.assertEqual(len(cached), 20)
-            self.assertEqual(cached[0]["content"], "完整问题2")
+            cached = manager.redis.get_session_conversation("u", "d", session_id)
+            self.assertEqual(len(cached), 24)
+            self.assertEqual(cached[0]["content"], "完整问题0")
             events = manager.events.list_events(user_id="u", device_id="d", event_type="message", limit=100)
             self.assertEqual(len(events), 24)
             self.assertTrue(any(e["content"] == "完整问题0" for e in events))
@@ -1141,6 +1243,10 @@ class MemorySystemTests(unittest.TestCase):
         self.assertIn("trace-view", html)
         self.assertIn("偏好抽取上下文", html)
         self.assertIn("run-preference-extract", html)
+        self.assertIn("device_id（用于设备隔离）", html)
+        self.assertIn('dev=$("memory-device").value.trim()', html)
+        self.assertIn("?device_id=${encodeURIComponent(dev)}", html)
+        self.assertIn("/api/debug/users/${encodeURIComponent(u)}${q}", html)
         self.assertIn("错误:", html)
         self.assertIn("模型警告:", html)
         self.assertIn("日期总结", html)
@@ -1832,9 +1938,10 @@ class MemorySystemTests(unittest.TestCase):
                 "问题0",
                 "回答0",
                 timestamp="2026-07-02T09:00:00+08:00",
+                prompt_token_count=6000,
             )
             self.assertIsNone(router.session_detail("user-001", first["session_id"])["summary"])
-            for idx in range(1, 10):
+            for idx in range(1, 20):
                 manager.add_conversation_turn(
                     f"roll-{idx}",
                     "user-001",
@@ -1843,6 +1950,7 @@ class MemorySystemTests(unittest.TestCase):
                     f"回答{idx}",
                     timestamp=f"2026-07-02T09:00:{idx:02d}+08:00",
                     session_id=first["session_id"],
+                    prompt_token_count=6000,
                 )
             self.assertTrue(manager.wait_for_summaries())
             detail = router.session_detail("user-001", first["session_id"])

@@ -28,6 +28,9 @@ class MemoryDebugRouter:
         context_started = time.perf_counter()
         context = self.manager.get_conversation_context(user_id, device_id)
         context_ms = (time.perf_counter() - context_started) * 1000
+        latest_action_sequence = context.get("latest_action_sequence")
+        prompt_messages = self._build_prompt_messages(query, context, latest_action_sequence)
+        prompt_token_count = self._estimate_prompt_tokens(prompt_messages)
 
         llm_started = time.perf_counter()
         try:
@@ -36,7 +39,7 @@ class MemoryDebugRouter:
                 context["recent_messages"][-10:],
                 context["rolling_summary"],
                 context["user_card"],
-                context.get("latest_action_sequence"),
+                latest_action_sequence,
             )
         except Exception as exc:
             logger.exception("chat.llm_failed request_id=%s user_id=%s device_id=%s", request_id, user_id, device_id)
@@ -53,6 +56,7 @@ class MemoryDebugRouter:
                 assistant_reply,
                 model_event_routes=model_info.get("event_routes") if isinstance(model_info.get("event_routes"), list) else None,
                 session_id=context.get("session_id"),
+                prompt_token_count=prompt_token_count,
             )
         except Exception as exc:
             logger.exception("chat.persistence_failed request_id=%s user_id=%s device_id=%s", request_id, user_id, device_id)
@@ -69,24 +73,6 @@ class MemoryDebugRouter:
             "model": str(model_info.get("model", self.llm.model)),
         }
         if debug:
-            latest_action_sequence = context.get("latest_action_sequence")
-            if hasattr(self.llm, "build_messages"):
-                prompt_messages = self.llm.build_messages(
-                    query,
-                    context["recent_messages"][-10:],
-                    context["rolling_summary"],
-                    context["user_card"],
-                    latest_action_sequence,
-                )
-            else:
-                prompt_messages = [
-                    {"role": "system", "content": "debug llm does not expose build_messages"},
-                    *[
-                        {"role": str(item.get("role")), "content": str(item.get("content"))}
-                        for item in context["recent_messages"][-10:]
-                    ],
-                    {"role": "user", "content": query},
-                ]
             result["debug"] = {
                 "context_ms": round(context_ms, 1),
                 "llm_ms": round(llm_ms, 1),
@@ -95,6 +81,7 @@ class MemoryDebugRouter:
                 "user_card_version": (context.get("user_card") or {}).get("version"),
                 "summary_version": context.get("summary_version", 0),
                 "session_id": context.get("session_id"),
+                "prompt_token_count": prompt_token_count,
                 "prompt_preview": self._prompt_preview(prompt_messages),
                 "prompt_messages": prompt_messages,
                 "trace_steps": self._trace_steps(
@@ -115,6 +102,55 @@ class MemoryDebugRouter:
                 ),
             }
         return result
+
+    def _build_prompt_messages(
+        self,
+        query: str,
+        context: dict[str, Any],
+        latest_action_sequence: dict[str, Any] | None,
+    ) -> list[dict[str, str]]:
+        if hasattr(self.llm, "build_messages"):
+            return self.llm.build_messages(
+                query,
+                context["recent_messages"][-10:],
+                context["rolling_summary"],
+                context["user_card"],
+                latest_action_sequence,
+            )
+        return [
+            {"role": "system", "content": "debug llm does not expose build_messages"},
+            *[
+                {"role": str(item.get("role")), "content": str(item.get("content"))}
+                for item in context["recent_messages"][-10:]
+            ],
+            {"role": "user", "content": query},
+        ]
+
+    @staticmethod
+    def _estimate_prompt_tokens(messages: list[dict[str, Any]]) -> int:
+        total = 0
+        for item in messages:
+            total += 4
+            total += MemoryDebugRouter._estimate_text_tokens(str(item.get("role") or ""))
+            total += MemoryDebugRouter._estimate_text_tokens(str(item.get("content") or ""))
+        return total + 2
+
+    @staticmethod
+    def _estimate_text_tokens(text: str) -> int:
+        ascii_run = 0
+        tokens = 0
+        for char in text:
+            if "\u4e00" <= char <= "\u9fff":
+                tokens += max(1, (ascii_run + 3) // 4)
+                ascii_run = 0
+                tokens += 1
+            elif char.isspace():
+                tokens += max(1, (ascii_run + 3) // 4) if ascii_run else 0
+                ascii_run = 0
+            else:
+                ascii_run += 1
+        tokens += max(1, (ascii_run + 3) // 4) if ascii_run else 0
+        return tokens
 
     @staticmethod
     def _prompt_preview(messages: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -235,13 +271,14 @@ class MemoryDebugRouter:
             },
         ]
 
-    def debug_user(self, user_id: str) -> dict[str, Any]:
+    def debug_user(self, user_id: str, device_id: str | None = None) -> dict[str, Any]:
         return {
             "user_id": user_id,
-            "user_card": self.manager.get_user_card(user_id) or self.manager.restore_user_card(user_id),
-            "active_preferences": self.manager.events.list_preferences(user_id, status="active", limit=100),
-            "candidate_preferences": self.manager.events.list_preferences(user_id, status="candidate", limit=100),
-            "evidence": self.manager.events.list_preference_evidence(user_id, limit=100),
+            "device_id": device_id,
+            "user_card": self.manager.get_user_card(user_id, device_id) or self.manager.restore_user_card(user_id, device_id),
+            "active_preferences": self.manager.events.list_preferences(user_id, status="active", limit=100, device_id=device_id),
+            "candidate_preferences": self.manager.events.list_preferences(user_id, status="candidate", limit=100, device_id=device_id),
+            "evidence": self.manager.events.list_preference_evidence(user_id, limit=100, device_id=device_id),
         }
 
     def sessions(
@@ -284,7 +321,12 @@ class MemoryDebugRouter:
             limit=500,
             ascending=True,
         )
-        summary = self.manager.events.latest_summary(user_id, device_id, str(session.get("local_date") or ""))
+        summary = self.manager.events.latest_summary(
+            user_id,
+            device_id,
+            str(session.get("local_date") or ""),
+            session_id=session_id,
+        )
         time_memories = [
             item
             for item in self.manager.events.list_time_memories(user_id, device_id, limit=100)
@@ -301,13 +343,14 @@ class MemoryDebugRouter:
             "time_memories": time_memories,
         }
 
-    def preferences(self, user_id: str) -> dict[str, Any]:
+    def preferences(self, user_id: str, device_id: str | None = None) -> dict[str, Any]:
         return {
             "user_id": user_id,
-            "active": self.manager.events.list_preferences(user_id, status="active", limit=200),
-            "candidate": self.manager.events.list_preferences(user_id, status="candidate", limit=200),
-            "history": self.manager.events.list_preferences(user_id, status=None, limit=500),
-            "evidence": self.manager.events.list_preference_evidence(user_id, limit=200),
+            "device_id": device_id,
+            "active": self.manager.events.list_preferences(user_id, status="active", limit=200, device_id=device_id),
+            "candidate": self.manager.events.list_preferences(user_id, status="candidate", limit=200, device_id=device_id),
+            "history": self.manager.events.list_preferences(user_id, status=None, limit=500, device_id=device_id),
+            "evidence": self.manager.events.list_preference_evidence(user_id, limit=200, device_id=device_id),
         }
 
     def events(self, user_id: str | None, device_id: str | None, role: str | None) -> dict[str, Any]:
@@ -508,7 +551,7 @@ class MemoryDebugRouter:
                 force_recent=force,
                 recent_user_messages=recent_user_messages,
             )
-            return {**result, "ok": not bool((result.get("process") or {}).get("errors")), "memory": self.debug_user(user_id), "status": self.status()}
+            return {**result, "ok": not bool((result.get("process") or {}).get("errors")), "memory": self.debug_user(user_id, device_id), "status": self.status()}
         except Exception as exc:
             logger.exception("preference_extract.debug_failed user_id=%s device_id=%s", user_id, device_id)
             return {
@@ -525,7 +568,7 @@ class MemoryDebugRouter:
                     "recovered_stale": 0,
                     "errors": [{"error": str(exc), "final": False}],
                 },
-                "memory": self.debug_user(user_id),
+                "memory": self.debug_user(user_id, device_id),
                 "status": self.status(),
             }
 
