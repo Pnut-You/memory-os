@@ -36,7 +36,7 @@ class MemoryDebugRouter:
         try:
             assistant_reply, model_info = self.llm.complete(
                 query,
-                context["recent_messages"][-10:],
+                context["recent_messages"],
                 context["rolling_summary"],
                 context["user_card"],
                 latest_action_sequence,
@@ -112,7 +112,7 @@ class MemoryDebugRouter:
         if hasattr(self.llm, "build_messages"):
             return self.llm.build_messages(
                 query,
-                context["recent_messages"][-10:],
+                context["recent_messages"],
                 context["rolling_summary"],
                 context["user_card"],
                 latest_action_sequence,
@@ -121,7 +121,7 @@ class MemoryDebugRouter:
             {"role": "system", "content": "debug llm does not expose build_messages"},
             *[
                 {"role": str(item.get("role")), "content": str(item.get("content"))}
-                for item in context["recent_messages"][-10:]
+                for item in context["recent_messages"]
             ],
             {"role": "user", "content": query},
         ]

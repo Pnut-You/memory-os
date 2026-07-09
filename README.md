@@ -430,6 +430,76 @@ uv run python -m unittest discover -s tests -v
 uv run python example.py
 ```
 
+短期记忆在当前 session 未触发滚动摘要前不会裁剪原文对话：20 轮以内全部进入回复 prompt；达到 20 轮后，只有完整 prompt 估算达到 `SHORT_MEMORY_PROMPT_TRIGGER_TOKENS` 时才摘要较早对话，并保留最近 `SHORT_MEMORY_RETAIN_RECENT_TURNS` 轮原文。短期记忆评测会先把每个 case 的前置对话写入当前 session，再调用一次回复模型回答追问，检查模型回复是否包含目标事实。默认数据集共 200 条，每条 10-20 轮，目标事实放在第 1-5 轮，后面追加机器狗短会话干扰内容。默认命令严格使用 Redis，Redis 不可用时会失败：
+
+```bash
+uv run python evaluation/run_short_term_eval.py
+```
+
+也可以直接使用 uv 创建的虚拟环境解释器：
+
+```bash
+.venv/bin/python evaluation/run_short_term_eval.py
+```
+
+不要直接运行 `python3 evaluation/run_short_term_eval.py`，因为系统 Python 通常没有 `redis`、`openai` 等项目依赖；`uv sync` 安装的是 `.venv` 环境。
+
+评测会在控制台打印每条 case 的 `expected`、`question`、`answer`、目标事实所在轮次和距离追问的轮次数，并把整理后的完整输入输出写入 `evaluation/results/short_term_eval_<timestamp>.jsonl`。每个 case 使用独立 `memory-os-short-eval:*` Redis 前缀，case 结束后会清理对应测试 key。
+
+先跑小样本可减少模型调用次数：
+
+```bash
+uv run python evaluation/run_short_term_eval.py --max-cases 5
+```
+
+保留的旧版 2-10 轮数据集：
+
+```bash
+uv run python evaluation/run_short_term_eval.py --dataset evaluation/datasets/short_term_memory_probe_2_10.jsonl
+```
+
+新版 10-20 轮高难度数据集：
+
+```bash
+uv run python evaluation/run_short_term_eval.py --dataset evaluation/datasets/short_term_memory_probe_10_20.jsonl
+```
+
+指定日志路径：
+
+```bash
+uv run python evaluation/run_short_term_eval.py --max-cases 5 --log-file evaluation/results/debug_short_eval.jsonl
+```
+
+只有本地无 Redis 调试时才显式允许内存 fallback：
+
+```bash
+uv run python evaluation/run_short_term_eval.py --allow-memory-redis-fallback
+```
+
+长期结构化偏好记忆评测主指标只检查 SQLite 中最终保存的 `profile.occupation`、`preference.likes`、`preference.dislikes`，不测试短期记忆、时间记忆、事件库或设备状态。默认数据集 60 条，职业、喜欢、不喜欢各 20 条。评测固定使用 `user-001` 和 `dog-005`，每个 case 会先清理该评测环境中的长期偏好状态：
+
+```bash
+uv run python evaluation/run_preference_eval.py
+```
+
+先跑小样本：
+
+```bash
+uv run python evaluation/run_preference_eval.py --max-cases 5
+```
+
+评测会在控制台打印每条 case 的输入、SQLite 抽取结果、验证问题和回复模型回答。验证阶段会先从 SQLite active preferences 重建长期用户卡片，再用空短期上下文向回复模型提问，因此验证回答只能依赖长期偏好卡片。外部偏好抽取模型超时或断连时，控制台只打印简洁 case 错误；JSONL 日志会写入完整 conversation、SQLite active preferences、user card、验证问题、验证回答、回复模型输入 `model_input_messages` 和失败原因。也可以指定日志路径：
+
+```bash
+uv run python evaluation/run_preference_eval.py --max-cases 5 --log-file evaluation/results/debug_preference_eval.jsonl
+```
+
+只跑某一类：
+
+```bash
+uv run python evaluation/run_preference_eval.py --type likes --max-cases 5
+```
+
 调试 UI：
 
 ```bash

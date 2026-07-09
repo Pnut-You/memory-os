@@ -224,22 +224,26 @@ class MemoryManager:
         session = self.resolve_session(user_id, device_id, timestamp=timestamp, session_id=session_id)
         local_date = str(session.get("local_date") or self._local_date(timestamp or iso_now()))
         session_id = str(session["session_id"])
-        bundle = self.redis.get_context_bundle(user_id, device_id, session_id, recent_limit=10)
+        bundle = self.redis.get_context_bundle(user_id, device_id, session_id, recent_limit=1)
         summary = bundle["summary"]
         if summary and str(summary.get("local_date") or "") != local_date:
             summary = None
         summary = summary or self._restore_summary(user_id, device_id, local_date, session_id)
         user_card = bundle["user_card"] or self.restore_user_card(user_id, device_id)
-        recent = self.redis.get_session_conversation(user_id, device_id, session_id, limit=10)
+        latest_summary_id = int((summary or {}).get("compacted_through_event_id", 0) or 0)
+        recent = [
+            item
+            for item in self.redis.get_session_conversation(user_id, device_id, session_id)
+            if int(item.get("id") or 0) > latest_summary_id
+        ]
         if not recent:
-            latest_summary_id = int((summary or {}).get("compacted_through_event_id", 0) or 0)
             recent = self.events.message_range(
                 user_id,
                 device_id,
                 latest_summary_id,
-                self.short_memory_retain_recent_turns * 2,
+                10000,
                 session_id=session_id,
-            )[-10:]
+            )
             if recent:
                 self.redis.append_session_conversation(
                     user_id,
@@ -247,7 +251,7 @@ class MemoryManager:
                     session_id,
                     recent,
                     ttl_seconds=self.session_ttl_seconds,
-                    max_items=20,
+                    max_items=None,
                 )
         latest_action = self.events.latest_action_sequence(user_id, device_id)
         return {
@@ -259,7 +263,7 @@ class MemoryManager:
             "rolling_summary": (summary or {}).get("summary_text", ""),
             "summary_version": int((summary or {}).get("version", 0) or 0),
             "summary_pending": self._conversation_states.get((user_id, device_id, session_id, local_date), _ConversationState()).summary_pending,
-            "recent_messages": recent[-10:],
+            "recent_messages": recent,
             "latest_action_sequence": latest_action,
         }
 
@@ -296,7 +300,7 @@ class MemoryManager:
             session["session_id"],
             messages,
             ttl_seconds=self.session_ttl_seconds,
-            max_items=max(self.short_memory_summary_min_turns, self.short_memory_retain_recent_turns) * 2,
+            max_items=None,
         )
         routed: dict[str, Any] = {}
         if model_event_routes:

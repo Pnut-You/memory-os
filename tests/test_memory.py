@@ -132,6 +132,26 @@ class RouteLLM(FakeLLM):
         return self.reply, {"model": self.model, "event_routes": self.event_routes}
 
 
+class RecallNameLLM(FakeLLM):
+    def complete(self, query, short_term, rolling_summary, user_card, latest_action_sequence=None):
+        self.calls.append(
+            {
+                "query": query,
+                "short_term": short_term,
+                "rolling_summary": rolling_summary,
+                "user_card": user_card,
+                "latest_action_sequence": latest_action_sequence,
+            }
+        )
+        for message in short_term:
+            content = str(message.get("content") or "")
+            marker = "机器狗叫"
+            if marker in content:
+                name = content.split(marker, 1)[1].split("。", 1)[0].split("，", 1)[0].strip()
+                return f"你刚才说机器狗叫{name}。", {"model": self.model}
+        return "你刚才没有提到机器狗的名字。", {"model": self.model}
+
+
 class MemorySystemTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -153,6 +173,30 @@ class MemorySystemTests(unittest.TestCase):
 
     def make_manager(self) -> MemoryManager:
         return MemoryManager.create(self.config, start_scheduler=False)
+
+    def add_short_memory_probe_turns(
+        self,
+        manager: MemoryManager,
+        *,
+        turn_count: int,
+        fact_turn: int,
+        fact_text: str,
+    ) -> None:
+        session_id = None
+        for turn in range(1, turn_count + 1):
+            if turn == fact_turn:
+                user_text = fact_text
+            else:
+                user_text = f"这是第{turn}轮普通短会话。"
+            result = manager.add_conversation_turn(
+                f"short-probe-{turn}",
+                "user-001",
+                "dog-001",
+                user_text,
+                f"第{turn}轮回复。",
+                session_id=session_id,
+            )
+            session_id = result["session_id"]
 
     def test_query_contract_requires_user_id_and_device_id(self):
         payload = QueryRequest(user_id="user-1", device_id="dog-1", query="你好")
@@ -1066,6 +1110,71 @@ class MemorySystemTests(unittest.TestCase):
             self.assertTrue(manager.wait_for_summaries())
             self.assertIsNone(manager.events.latest_summary("u", "d"))
             self.assertEqual(capture.calls, [])
+        finally:
+            manager.close()
+
+    def test_ten_turn_session_enters_prompt_without_truncating_first_fact(self):
+        manager = self.make_manager()
+        llm = RecallNameLLM()
+        router = MemoryDebugRouter(manager, llm)
+        try:
+            self.add_short_memory_probe_turns(
+                manager,
+                turn_count=10,
+                fact_turn=1,
+                fact_text="我的机器狗叫小黑。",
+            )
+            result = router.submit("user-001", "dog-001", "机器狗叫什么？", debug=True)
+            prompt_text = "\n".join(item["content"] for item in result["debug"]["prompt_messages"])
+            self.assertIn("小黑", prompt_text)
+            self.assertIn("小黑", result["assistant_reply"])
+            self.assertEqual(len(llm.calls[0]["short_term"]), 20)
+            self.assertIn("小黑", llm.calls[0]["short_term"][0]["content"])
+        finally:
+            manager.close()
+
+    def test_fourteen_turn_session_enters_prompt_without_truncating_middle_fact(self):
+        manager = self.make_manager()
+        llm = RecallNameLLM()
+        router = MemoryDebugRouter(manager, llm)
+        try:
+            self.add_short_memory_probe_turns(
+                manager,
+                turn_count=14,
+                fact_turn=4,
+                fact_text="我的机器狗叫可乐。",
+            )
+            result = router.submit("user-001", "dog-001", "机器狗叫什么？", debug=True)
+            prompt_text = "\n".join(item["content"] for item in result["debug"]["prompt_messages"])
+            self.assertIn("可乐", prompt_text)
+            self.assertIn("可乐", result["assistant_reply"])
+            self.assertEqual(len(llm.calls[0]["short_term"]), 28)
+            self.assertTrue(any("可乐" in item["content"] for item in llm.calls[0]["short_term"]))
+        finally:
+            manager.close()
+
+    def test_twenty_turn_session_under_token_trigger_enters_prompt_without_summary_or_truncation(self):
+        manager = self.make_manager()
+        capture = CaptureSummarizer()
+        manager.summarizer = capture
+        llm = RecallNameLLM()
+        router = MemoryDebugRouter(manager, llm)
+        try:
+            self.add_short_memory_probe_turns(
+                manager,
+                turn_count=20,
+                fact_turn=1,
+                fact_text="我的机器狗叫小黑。",
+            )
+            result = router.submit("user-001", "dog-001", "机器狗叫什么？", debug=True)
+            self.assertLess(result["debug"]["prompt_token_count"], 5000)
+            self.assertIsNone(manager.events.latest_summary("user-001", "dog-001"))
+            self.assertEqual(capture.calls, [])
+            self.assertEqual(len(llm.calls[0]["short_term"]), 40)
+            prompt_text = "\n".join(item["content"] for item in result["debug"]["prompt_messages"])
+            for turn in range(1, 21):
+                expected = "我的机器狗叫小黑。" if turn == 1 else f"这是第{turn}轮普通短会话。"
+                self.assertIn(expected, prompt_text)
         finally:
             manager.close()
 

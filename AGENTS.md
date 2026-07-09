@@ -49,5 +49,5 @@ Memory OS 是面向机器狗、IoT 设备和通用 Agent 的裸 Python 分层记
 python3 -m unittest discover -s tests -v
 python3 example.py
 ```
-
-每次运行完成需要告诉用户具体运行命令。
+## 补充说明
+每次修改代码后，需要告诉用户具体运行命令。
