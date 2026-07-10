@@ -272,6 +272,23 @@ class ShortTermMemory:
             self._memory.pop(key, None)
             self._expires.pop(key, None)
 
+    def delete_user_cards(self, user_id: str) -> None:
+        pattern = f"{self.prefix}:user-card:{user_id}*"
+        if self._redis is not None:
+            try:
+                keys = list(self._redis.scan_iter(match=pattern, count=100))
+                if keys:
+                    self._redis.delete(*keys)
+            except Exception as exc:
+                if not self.allow_memory_fallback:
+                    raise ConnectionError("Redis user card cleanup failed") from exc
+                self._redis = None
+        with self._lock:
+            prefix = f"{self.prefix}:user-card:{user_id}"
+            for key in [item for item in self._memory if item == prefix or item.startswith(prefix + ":")]:
+                self._memory.pop(key, None)
+                self._expires.pop(key, None)
+
     def _purge_expired(self, key: str) -> None:
         if self._expires.get(key, float("inf")) <= time.time():
             self._memory.pop(key, None)

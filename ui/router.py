@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -29,21 +30,39 @@ class MemoryDebugRouter:
         context = self.manager.get_conversation_context(user_id, device_id)
         context_ms = (time.perf_counter() - context_started) * 1000
         latest_action_sequence = context.get("latest_action_sequence")
-        prompt_messages = self._build_prompt_messages(query, context, latest_action_sequence)
+        long_term_field = self.manager.classify_long_term_fact_query(query)
+        retrieved_long_term_facts: dict[str, Any] | None = None
+        if long_term_field:
+            assistant_reply, retrieved_long_term_facts = self.manager.answer_long_term_fact(user_id, long_term_field)
+            prompt_messages = [
+                {
+                    "role": "system",
+                    "content": json.dumps(
+                        {"retrieved_long_term_facts": retrieved_long_term_facts},
+                        ensure_ascii=False,
+                    ),
+                },
+                {"role": "user", "content": query},
+            ]
+        else:
+            prompt_messages = self._build_prompt_messages(query, context, latest_action_sequence)
         prompt_token_count = self._estimate_prompt_tokens(prompt_messages)
 
         llm_started = time.perf_counter()
-        try:
-            assistant_reply, model_info = self.llm.complete(
-                query,
-                context["recent_messages"],
-                context["rolling_summary"],
-                context["user_card"],
-                latest_action_sequence,
-            )
-        except Exception as exc:
-            logger.exception("chat.llm_failed request_id=%s user_id=%s device_id=%s", request_id, user_id, device_id)
-            raise RuntimeError(f"LLM request failed: {exc}") from exc
+        if long_term_field:
+            model_info = {"model": "sqlite-long-term-facts", "usage": {}, "event_routes": []}
+        else:
+            try:
+                assistant_reply, model_info = self.llm.complete(
+                    query,
+                    context["recent_messages"],
+                    context["rolling_summary"],
+                    context["user_card"],
+                    latest_action_sequence,
+                )
+            except Exception as exc:
+                logger.exception("chat.llm_failed request_id=%s user_id=%s device_id=%s", request_id, user_id, device_id)
+                raise RuntimeError(f"LLM request failed: {exc}") from exc
         llm_ms = (time.perf_counter() - llm_started) * 1000
 
         persist_started = time.perf_counter()
@@ -57,6 +76,7 @@ class MemoryDebugRouter:
                 model_event_routes=model_info.get("event_routes") if isinstance(model_info.get("event_routes"), list) else None,
                 session_id=context.get("session_id"),
                 prompt_token_count=prompt_token_count,
+                schedule_preference_extraction=not bool(long_term_field),
             )
         except Exception as exc:
             logger.exception("chat.persistence_failed request_id=%s user_id=%s device_id=%s", request_id, user_id, device_id)
@@ -84,6 +104,7 @@ class MemoryDebugRouter:
                 "prompt_token_count": prompt_token_count,
                 "prompt_preview": self._prompt_preview(prompt_messages),
                 "prompt_messages": prompt_messages,
+                "retrieved_long_term_facts": retrieved_long_term_facts,
                 "trace_steps": self._trace_steps(
                     request_id,
                     user_id,
@@ -276,9 +297,9 @@ class MemoryDebugRouter:
             "user_id": user_id,
             "device_id": device_id,
             "user_card": self.manager.get_user_card(user_id, device_id) or self.manager.restore_user_card(user_id, device_id),
-            "active_preferences": self.manager.events.list_preferences(user_id, status="active", limit=100, device_id=device_id),
-            "candidate_preferences": self.manager.events.list_preferences(user_id, status="candidate", limit=100, device_id=device_id),
-            "evidence": self.manager.events.list_preference_evidence(user_id, limit=100, device_id=device_id),
+            "active_preferences": self._preferences_for_scope(user_id, "active", device_id, 100),
+            "candidate_preferences": self._preferences_for_scope(user_id, "candidate", device_id, 100),
+            "evidence": self._preference_evidence_for_scope(user_id, device_id, 100),
         }
 
     def sessions(
@@ -347,11 +368,48 @@ class MemoryDebugRouter:
         return {
             "user_id": user_id,
             "device_id": device_id,
-            "active": self.manager.events.list_preferences(user_id, status="active", limit=200, device_id=device_id),
-            "candidate": self.manager.events.list_preferences(user_id, status="candidate", limit=200, device_id=device_id),
-            "history": self.manager.events.list_preferences(user_id, status=None, limit=500, device_id=device_id),
-            "evidence": self.manager.events.list_preference_evidence(user_id, limit=200, device_id=device_id),
+            "active": self._preferences_for_scope(user_id, "active", device_id, 200),
+            "candidate": self._preferences_for_scope(user_id, "candidate", device_id, 200),
+            "history": self._preferences_for_scope(user_id, None, device_id, 500),
+            "evidence": self._preference_evidence_for_scope(user_id, device_id, 200),
         }
+
+    def _preferences_for_scope(
+        self,
+        user_id: str,
+        status: str | None,
+        device_id: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if not device_id:
+            return self.manager.events.list_preferences(user_id, status=status, limit=limit)
+        primary_keys = {"profile.occupation", "preference.likes", "preference.dislikes"}
+        user_primary = self.manager.events.list_primary_preferences(user_id, status=status, limit=limit)
+        device_preferences = [
+            item
+            for item in self.manager.events.list_preferences(
+                user_id, status=status, limit=limit, device_id=device_id
+            )
+            if item.get("preference_key") not in primary_keys
+        ]
+        return (user_primary + device_preferences)[:limit]
+
+    def _preference_evidence_for_scope(
+        self,
+        user_id: str,
+        device_id: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        evidence = self.manager.events.list_preference_evidence(user_id, limit=limit)
+        if not device_id:
+            return evidence
+        primary_keys = {"profile.occupation", "preference.likes", "preference.dislikes"}
+        return [
+            item
+            for item in evidence
+            if item.get("preference_key") in primary_keys
+            or item.get("preference_device_id") == device_id
+        ][:limit]
 
     def events(self, user_id: str | None, device_id: str | None, role: str | None) -> dict[str, Any]:
         return {

@@ -25,11 +25,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from memory import MemoryConfig, MemoryManager  # noqa: E402
-from ui.llm import DebugChatLLM  # noqa: E402
 
 
 EXPECTED_CASE_COUNT = 60
-EXPECTED_USER_ID = "user-001"
 EXPECTED_DEVICE_ID = "dog-005"
 EXPECTED_COUNTS = {
     "occupation": 20,
@@ -123,8 +121,6 @@ def validate_case(case: dict[str, Any], line_number: int) -> None:
     expected = case.get("expected")
     if not all(isinstance(value, str) and value for value in (case_id, user_id, device_id)):
         raise ValueError(f"line {line_number}: case_id/user_id/device_id must be non-empty strings")
-    if user_id != EXPECTED_USER_ID:
-        raise ValueError(f"{case_id}: user_id must be {EXPECTED_USER_ID}")
     if device_id != EXPECTED_DEVICE_ID:
         raise ValueError(f"{case_id}: device_id must be {EXPECTED_DEVICE_ID}")
     if not isinstance(conversation, list) or len(conversation) < 2 or len(conversation) % 2:
@@ -208,15 +204,6 @@ def make_config(temp_root: Path, allow_memory_redis_fallback: bool, redis_prefix
     return config
 
 
-def make_llm(config: MemoryConfig) -> DebugChatLLM:
-    return DebugChatLLM(
-        api_key=config.llm_api_key,
-        base_url=config.llm_base_url,
-        model=config.llm_model,
-        api_key_source=config.llm_api_key_source,
-    )
-
-
 def ensure_redis_available(config: MemoryConfig, allow_memory_redis_fallback: bool) -> None:
     if allow_memory_redis_fallback:
         return
@@ -274,24 +261,6 @@ def ensure_extractor_configured(manager: MemoryManager) -> None:
             "Preference extractor is not configured. Set PREFERENCE_EXTRACTOR_API_KEY "
             "or DASHSCOPE_API_KEY before running the evaluation."
         )
-
-
-def ensure_reply_llm_configured(config: MemoryConfig) -> None:
-    llm = make_llm(config)
-    status = llm.status()
-    print(
-        f"reply llm model: {status.get('model')} "
-        f"base_url: {status.get('base_url')} key_source: {status.get('api_key_source') or '-'}",
-        file=sys.stderr,
-    )
-    if not llm.configured:
-        raise RuntimeError(
-            "Reply LLM is not configured. Set DASHSCOPE_API_KEY or LLM_API_KEY "
-            "before running preference verification."
-        )
-    config_error = llm._configuration_error()
-    if config_error:
-        raise RuntimeError(config_error)
 
 
 def write_case_conversation(manager: MemoryManager, case: dict[str, Any]) -> None:
@@ -365,10 +334,24 @@ def user_input_text(case: dict[str, Any]) -> str:
 
 def verification_question(field: str) -> str:
     if field == "occupation":
-        return "根据你的长期记忆，我的职业是什么？"
+        return "请只根据长期记忆事实回答，人类用户的职业是什么？只回答职业名称。"
     if field == "likes":
-        return "根据你的长期记忆，我喜欢什么？"
-    return "根据你的长期记忆，我不喜欢什么？"
+        return "请只根据长期记忆事实回答，人类用户喜欢什么？只回答记忆中的对象。"
+    return "请只根据长期记忆事实回答，人类用户不喜欢什么？只回答记忆中的对象。"
+
+
+def normalize_answer_text(value: str) -> str:
+    ignored = set(" \t\r\n，。！？、；：,.!?;:\"'“”‘’（）()[]【】《》<>")
+    ignored.update({"的"})
+    return "".join(char for char in str(value) if char not in ignored)
+
+
+def answer_contains_expected(answer: str, expected: str) -> bool:
+    if str(expected) in str(answer):
+        return True
+    normalized_answer = normalize_answer_text(answer)
+    normalized_expected = normalize_answer_text(expected)
+    return bool(normalized_expected and normalized_expected in normalized_answer)
 
 
 def run_preference_verification(
@@ -378,42 +361,63 @@ def run_preference_verification(
     field: str,
     expected: list[str],
 ) -> dict[str, Any]:
-    user_card = manager.rebuild_user_card(case["user_id"], case["device_id"]) or {}
-    llm = make_llm(config)
     question = verification_question(field)
-    messages = llm.build_messages(
-        question,
-        short_term=[],
-        rolling_summary="",
-        user_card=user_card,
-        latest_action_sequence=None,
+    answer, facts = manager.answer_long_term_fact(case["user_id"], field)
+    user_card = manager.rebuild_user_card(case["user_id"], case["device_id"]) or {}
+    verification_prompt = json.dumps(
+        {"question": question, "retrieved_long_term_facts": facts},
+        ensure_ascii=False,
+        sort_keys=True,
     )
-    answer, model_info = llm.complete(
-        question,
-        short_term=[],
-        rolling_summary="",
-        user_card=user_card,
-        latest_action_sequence=None,
-    )
-    missing = [item for item in expected if str(item) not in answer]
+    missing = [item for item in expected if not answer_contains_expected(answer, str(item))]
     return {
         "verify_question": question,
         "verify_answer": answer,
         "verify_passed": not missing,
         "verification_reason": "" if not missing else f"answer missing expected: {', '.join(missing)}",
-        "model_input_messages": messages,
+        "verification_prompt": verification_prompt,
+        "retrieved_long_term_facts": facts,
+        "model_input_messages": [],
         "user_card": user_card,
-        "reply_llm_model": model_info.get("model") or llm.model,
-        "reply_llm_usage": model_info.get("usage") or {},
+        "reply_llm_model": "sqlite-long-term-facts",
+        "reply_llm_usage": {},
     }
+
+
+def extraction_diagnostics(process: dict[str, Any]) -> dict[str, Any]:
+    pending = [process]
+    while pending:
+        current = pending.pop(0)
+        for job in current.get("jobs") or []:
+            if not isinstance(job, dict):
+                continue
+            if any(name in job for name in ("extractor_raw_output", "extractor_validated_output", "fallback_used")):
+                return {
+                    "extractor_raw_output": job.get("extractor_raw_output") or [],
+                    "extractor_validated_output": job.get("extractor_validated_output") or [],
+                    "fallback_used": bool(job.get("fallback_used")),
+                }
+        for error in current.get("errors") or []:
+            if isinstance(error, dict) and error.get("extractor_raw_output"):
+                return {
+                    "extractor_raw_output": error.get("extractor_raw_output") or [],
+                    "extractor_validated_output": error.get("extractor_validated_output") or [],
+                    "fallback_used": bool(error.get("fallback_used")),
+                }
+        follow_up = current.get("follow_up")
+        if isinstance(follow_up, dict):
+            pending.append(follow_up)
+    return {"extractor_raw_output": [], "extractor_validated_output": [], "fallback_used": False}
 
 
 def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> dict[str, Any]:
     redis_prefix = f"memory-os-pref-eval:{case['case_id']}:{uuid.uuid4().hex}"
+    runtime_user_id = f"pref-eval-{case['case_id']}-{uuid.uuid4().hex[:12]}"
+    runtime_case = {**case, "user_id": runtime_user_id}
     started = time.monotonic()
     record: dict[str, Any] = {
         "case_id": str(case["case_id"]),
-        "user_id": str(case["user_id"]),
+        "user_id": runtime_user_id,
         "device_id": str(case["device_id"]),
         "field": expected_field(case),
         "expected": expected_values(case),
@@ -421,6 +425,7 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
         "conversation": case["conversation"],
         "active_preferences": [],
         "preference_extractor_model": "",
+        "preference_extractor_mode": "",
         "reply_llm_model": "",
         "redis_prefix": redis_prefix,
         "sqlite_passed": False,
@@ -433,6 +438,11 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
         "model_input_messages": [],
         "user_card": {},
         "reply_llm_usage": {},
+        "extractor_raw_output": [],
+        "extractor_validated_output": [],
+        "retrieved_long_term_facts": {},
+        "verification_prompt": "",
+        "fallback_used": False,
         "elapsed_seconds": None,
         "redis_cleanup": {"redis_prefix": redis_prefix, "deleted": 0, "errors": []},
     }
@@ -442,16 +452,34 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
         try:
             ensure_extractor_configured(manager)
             record["preference_extractor_model"] = manager.preference_extractor.model
-            manager.delete_user_memory(EXPECTED_USER_ID)
-            write_case_conversation(manager, case)
+            record["preference_extractor_mode"] = manager.preference_extractor.mode
+            manager.delete_user_memory(runtime_user_id)
+            write_case_conversation(manager, runtime_case)
             with suppress_memory_job_tracebacks():
                 result = manager.trigger_preference_extraction(
-                    case["user_id"],
-                    case["device_id"],
+                    runtime_user_id,
+                    runtime_case["device_id"],
                     force_recent=True,
                     recent_user_messages=20,
                 )
             process = result.get("process") or {}
+            process_runs = [process]
+            while process.get("failed") and any(
+                not bool(error.get("final"))
+                for error in process.get("errors") or []
+                if isinstance(error, dict)
+            ):
+                with suppress_memory_job_tracebacks():
+                    process = manager.process_memory_jobs_once(limit=2)
+                process_runs.append(process)
+            diagnostics = [extraction_diagnostics(item) for item in process_runs]
+            record["extractor_raw_output"] = [
+                output for item in diagnostics for output in item["extractor_raw_output"]
+            ]
+            record["extractor_validated_output"] = [
+                output for item in diagnostics for output in item["extractor_validated_output"]
+            ]
+            record["fallback_used"] = any(item["fallback_used"] for item in diagnostics)
             if process.get("failed"):
                 errors = process.get("errors") or []
                 detail = errors[0].get("error") if errors and isinstance(errors[0], dict) else "unknown error"
@@ -461,10 +489,10 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
             with suppress_memory_job_tracebacks():
                 process_follow_up_jobs(manager)
             preferences = manager.events.list_preferences(
-                case["user_id"],
+                runtime_user_id,
                 status="active",
                 limit=100,
-                device_id=case["device_id"],
+                device_id=None,
             )
             record["active_preferences"] = preferences
             field = str(record["field"])
@@ -480,14 +508,16 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
                 verification = run_preference_verification(
                     manager,
                     config,
-                    case,
+                    runtime_case,
                     field,
                     [str(item) for item in record["expected"]],
                 )
                 record.update(verification)
             except Exception as exc:
                 record["verification_reason"] = f"verification failed: {type(exc).__name__}: {exc}"
-            record["passed"] = True
+            record["passed"] = bool(record.get("sqlite_passed") and record.get("verify_passed"))
+            if not record["passed"] and not record["reason"]:
+                record["reason"] = record.get("verification_reason") or "verification failed"
             return record
         except Exception as exc:
             record["reason"] = f"{type(exc).__name__}: {exc}"
@@ -517,8 +547,6 @@ def preflight_environment(allow_memory_redis_fallback: bool) -> None:
                 file=sys.stderr,
             )
             ensure_extractor_configured(manager)
-            ensure_reply_llm_configured(config)
-            manager.delete_user_memory(EXPECTED_USER_ID)
         finally:
             cleanup = cleanup_eval_keys(config, redis_prefix, manager)
             if cleanup["errors"]:
@@ -538,6 +566,7 @@ def default_log_file() -> Path:
 def format_log_record(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "case_id": record.get("case_id"),
+        "user_id": record.get("user_id"),
         "field": record.get("field"),
         "expected": record.get("expected") or [],
         "actual": record.get("actual") or [],
@@ -548,6 +577,11 @@ def format_log_record(record: dict[str, Any]) -> dict[str, Any]:
         "verify_answer": record.get("verify_answer") or "",
         "verify_passed": bool(record.get("verify_passed")),
         "verification_reason": record.get("verification_reason") or "",
+        "extractor_raw_output": record.get("extractor_raw_output") or [],
+        "extractor_validated_output": record.get("extractor_validated_output") or [],
+        "retrieved_long_term_facts": record.get("retrieved_long_term_facts") or {},
+        "verification_prompt": record.get("verification_prompt") or "",
+        "fallback_used": bool(record.get("fallback_used")),
         "elapsed_seconds": record.get("elapsed_seconds"),
         "redis_cleanup": record.get("redis_cleanup"),
         "debug": {
@@ -558,6 +592,7 @@ def format_log_record(record: dict[str, Any]) -> dict[str, Any]:
             "user_card": record.get("user_card") or {},
             "model_input_messages": record.get("model_input_messages") or [],
             "preference_extractor_model": record.get("preference_extractor_model"),
+            "preference_extractor_mode": record.get("preference_extractor_mode"),
             "reply_llm_model": record.get("reply_llm_model"),
             "reply_llm_usage": record.get("reply_llm_usage") or {},
             "redis_prefix": record.get("redis_prefix"),
@@ -622,7 +657,7 @@ def verification_failed_case_output(record: dict[str, Any]) -> list[dict[str, An
             "reason": record.get("verification_reason") or "verification failed",
         }
         for expected in record.get("expected") or []
-        if str(expected) not in answer
+        if not answer_contains_expected(answer, str(expected))
     ]
 
 
@@ -653,6 +688,7 @@ def run() -> int:
 
     totals: dict[str, int] = defaultdict(int)
     passed: dict[str, int] = defaultdict(int)
+    sqlite_passed: dict[str, int] = defaultdict(int)
     failed_cases: list[dict[str, Any]] = []
     verification_total = 0
     verification_passed = 0
@@ -677,6 +713,8 @@ def run() -> int:
                 passed[field] += 1
             else:
                 failed_cases.extend(failed_case_output(record))
+            if record.get("sqlite_passed"):
+                sqlite_passed[field] += 1
             if record.get("verify_question"):
                 verification_total += 1
                 if record.get("verify_passed"):
@@ -695,13 +733,19 @@ def run() -> int:
 
     total_cases = len(cases)
     total_passed = sum(passed.values())
+    total_sqlite_passed = sum(sqlite_passed.values())
     output = {
         "total_cases": total_cases,
         "overall_accuracy": accuracy(total_passed, total_cases),
         "occupation_accuracy": accuracy(passed["occupation"], totals["occupation"]),
         "likes_accuracy": accuracy(passed["likes"], totals["likes"]),
         "dislikes_accuracy": accuracy(passed["dislikes"], totals["dislikes"]),
+        "sqlite_accuracy": accuracy(total_sqlite_passed, total_cases),
+        "sqlite_occupation_accuracy": accuracy(sqlite_passed["occupation"], totals["occupation"]),
+        "sqlite_likes_accuracy": accuracy(sqlite_passed["likes"], totals["likes"]),
+        "sqlite_dislikes_accuracy": accuracy(sqlite_passed["dislikes"], totals["dislikes"]),
         "verification_accuracy": accuracy(verification_passed, verification_total),
+        "verification_attempted": verification_total,
         "log_file": str(log_file),
         "failed_cases": failed_cases,
         "verification_failed_cases": verification_failed_cases,

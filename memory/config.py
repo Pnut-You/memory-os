@@ -12,6 +12,7 @@ from .utils import load_dotenv
 QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 QWEN_CHAT_MODEL = "qwen3.7-plus"
 QWEN_MEMORY_MODEL = "qwen3.7-max"
+QWEN_SMALL_MEMORY_MODEL = "codeqwen1.5-7b-chat"
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -53,6 +54,9 @@ class MemoryConfig:
     preference_extractor_api_key: str = ""
     preference_extractor_api_key_source: str = ""
     preference_extractor_model: str = ""
+    long_term_extractor_mode: str = "small"
+    long_term_small_model: str = QWEN_SMALL_MEMORY_MODEL
+    long_term_large_model: str = QWEN_MEMORY_MODEL
     preference_extract_batch_size: int = 8
     preference_extract_min_new_user_messages: int = 10
     preference_extract_max_attempts: int = 3
@@ -65,6 +69,9 @@ class MemoryConfig:
         preference_api_key, preference_api_key_source = _first_env(
             ("PREFERENCE_EXTRACTOR_API_KEY", "DASHSCOPE_API_KEY", "LLM_API_KEY")
         )
+        long_term_extractor_mode = os.getenv("LONG_TERM_EXTRACTOR_MODE", "small").strip().lower()
+        if long_term_extractor_mode not in {"small", "hybrid", "large"}:
+            raise ValueError("LONG_TERM_EXTRACTOR_MODE must be small, hybrid, or large")
         return cls(
             data_dir=data_dir,
             sqlite_path=Path(os.getenv("MEMORY_SQLITE_PATH", str(data_dir / "events.db"))),
@@ -112,6 +119,9 @@ class MemoryConfig:
             preference_extractor_api_key_source=preference_api_key_source,
             preference_extractor_model=os.getenv("PREFERENCE_EXTRACTOR_MODEL")
             or QWEN_MEMORY_MODEL,
+            long_term_extractor_mode=long_term_extractor_mode,
+            long_term_small_model=os.getenv("LONG_TERM_SMALL_MODEL", QWEN_SMALL_MEMORY_MODEL),
+            long_term_large_model=os.getenv("LONG_TERM_LARGE_MODEL", QWEN_MEMORY_MODEL),
             preference_extract_batch_size=max(1, int(os.getenv("PREFERENCE_EXTRACT_BATCH_SIZE", "8"))),
             preference_extract_min_new_user_messages=max(
                 1, int(os.getenv("PREFERENCE_EXTRACT_MIN_NEW_USER_MESSAGES", "10"))
