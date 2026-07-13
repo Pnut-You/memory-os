@@ -53,6 +53,7 @@ class DebugChatLLM:
                 model=self.model,
                 messages=messages,
                 temperature=0.6,
+                extra_body={"enable_thinking": False},
             )
         except Exception as exc:
             if self._is_auth_error(exc):

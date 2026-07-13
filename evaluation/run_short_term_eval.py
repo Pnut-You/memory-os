@@ -11,6 +11,7 @@ import json
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -27,7 +28,8 @@ from ui.llm import DebugChatLLM  # noqa: E402
 from ui.router import MemoryDebugRouter  # noqa: E402
 
 
-EXPECTED_CASE_COUNT = 200
+DEFAULT_DATASET = PROJECT_ROOT / "evaluation" / "datasets" / "short_term_memory_probe.jsonl"
+EXPECTED_DEFAULT_CASE_COUNT = 400
 MIN_TURNS = 2
 MAX_TURNS = 20
 
@@ -48,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         type=Path,
-        default=PROJECT_ROOT / "evaluation" / "datasets" / "short_term_memory_probe.jsonl",
+        default=DEFAULT_DATASET,
         help="Path to the short-term memory JSONL dataset.",
     )
     parser.add_argument(
@@ -95,8 +97,12 @@ def load_dataset(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"{case_id}: duplicate case_id")
             seen_case_ids.add(case_id)
             cases.append(case)
-    if len(cases) != EXPECTED_CASE_COUNT:
-        raise ValueError(f"dataset must contain {EXPECTED_CASE_COUNT} cases, got {len(cases)}")
+    if path.resolve() == DEFAULT_DATASET.resolve() and len(cases) != EXPECTED_DEFAULT_CASE_COUNT:
+        raise ValueError(
+            f"default dataset must contain {EXPECTED_DEFAULT_CASE_COUNT} cases, got {len(cases)}"
+        )
+    if not cases:
+        raise ValueError("dataset must contain at least one case")
     validate_turn_distribution(cases)
     return cases
 
@@ -365,9 +371,19 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
             debug = response.get("debug") if isinstance(response.get("debug"), dict) else {}
             record["model_input_messages"] = debug.get("prompt_messages") or []
             record["request_id"] = response.get("request_id")
-            for keyword in case["expected"]["must_contain"]:
-                if str(keyword) not in reply:
-                    record["reason"] = f"missing keyword: {keyword}"
+            normalized_reply = normalize_match_text(reply)
+            record["normalized_reply"] = normalized_reply
+            record["normalized_expected"] = [
+                normalize_match_text(str(keyword)) for keyword in case["expected"]["must_contain"]
+            ]
+            for keyword, normalized_keyword in zip(
+                case["expected"]["must_contain"], record["normalized_expected"]
+            ):
+                if normalized_keyword not in normalized_reply:
+                    record["reason"] = (
+                        f"missing normalized keyword: {keyword} "
+                        f"(normalized={normalized_keyword!r}, reply={normalized_reply!r})"
+                    )
                     return record
             record["passed"] = True
             return record
@@ -383,6 +399,17 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
 
 def accuracy(passed: int, total: int) -> float:
     return round(passed / total, 4) if total else 0.0
+
+
+def normalize_match_text(value: str) -> str:
+    """Normalize harmless Chinese surface differences for deterministic evaluation."""
+    return "".join(
+        character.lower()
+        for character in unicodedata.normalize("NFKC", str(value))
+        if character not in {"的", "地", "得"}
+        and not character.isspace()
+        and not unicodedata.category(character).startswith(("P", "S"))
+    )
 
 
 def default_log_file() -> Path:
@@ -414,6 +441,8 @@ def format_log_record(record: dict[str, Any]) -> dict[str, Any]:
         "expected_text": expected_text(record),
         "probe_question": record.get("probe_question"),
         "assistant_reply": record.get("assistant_reply"),
+        "normalized_expected": record.get("normalized_expected") or [],
+        "normalized_reply": record.get("normalized_reply") or "",
         "passed": bool(record.get("passed")),
         "reason": record.get("reason") or "",
         "elapsed_seconds": record.get("elapsed_seconds"),

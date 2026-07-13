@@ -10,9 +10,10 @@ from .utils import load_dotenv
 
 
 QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-QWEN_CHAT_MODEL = "qwen3.7-plus"
-QWEN_MEMORY_MODEL = "qwen3.7-max"
-QWEN_SMALL_MEMORY_MODEL = "codeqwen1.5-7b-chat"
+QWEN_FLASH_MODEL = "qwen3.5-flash-2026-02-23"
+QWEN_CHAT_MODEL = QWEN_FLASH_MODEL
+QWEN_MEMORY_MODEL = QWEN_FLASH_MODEL
+QWEN_SMALL_MEMORY_MODEL = QWEN_FLASH_MODEL
 
 
 def _bool(name: str, default: bool) -> bool:

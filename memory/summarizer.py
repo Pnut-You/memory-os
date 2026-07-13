@@ -73,6 +73,7 @@ class Summarizer:
         previous = previous_summary or "（暂无，这是第一次压缩）"
         payload = {
             "model": self.model,
+            "enable_thinking": False,
             "temperature": 0.1,
             "messages": [
                 {
@@ -103,6 +104,7 @@ class Summarizer:
         transcript = self._transcript(messages)
         payload = {
             "model": self.model,
+            "enable_thinking": False,
             "temperature": 0.1,
             "messages": [
                 {
@@ -140,6 +142,7 @@ class Summarizer:
         ]
         payload = {
             "model": self.model,
+            "enable_thinking": False,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
             "messages": [

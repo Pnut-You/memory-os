@@ -264,8 +264,8 @@ class PreferenceExtractor:
         base_url: str,
         model: str,
         mode: str = "small",
-        small_model: str = "codeqwen1.5-7b-chat",
-        large_model: str = "qwen3.7-max",
+        small_model: str = "qwen3.5-flash-2026-02-23",
+        large_model: str = "qwen3.5-flash-2026-02-23",
         prompt_version: str = "preferences-v1",
     ) -> None:
         self.enabled = enabled
@@ -403,6 +403,7 @@ class PreferenceExtractor:
     def _request_strict_extraction(self, model: str, source_text: str) -> str:
         payload = {
             "model": model,
+            "enable_thinking": False,
             "temperature": 0,
             "max_tokens": 160,
             "response_format": {"type": "json_object"},
@@ -516,6 +517,7 @@ class PreferenceExtractor:
             return ActionPreferenceExtractionResult(schema_version="1.0", user_id=user_id, memories=[])
         payload = {
             "model": self.action_model,
+            "enable_thinking": False,
             "temperature": 0.1,
             "max_tokens": 1600,
             "response_format": {"type": "json_object"},

@@ -763,7 +763,9 @@ class MemorySystemTests(unittest.TestCase):
         self.assertEqual(config.preference_extractor_api_key, "sk-dashscope-key")
         self.assertEqual(config.preference_extractor_api_key_source, "DASHSCOPE_API_KEY")
         self.assertEqual(config.preference_extractor_base_url, "https://dashscope.aliyuncs.com/compatible-mode/v1")
-        self.assertEqual(config.preference_extractor_model, "qwen3.7-max")
+        self.assertEqual(config.preference_extractor_model, "qwen3.5-flash-2026-02-23")
+        self.assertEqual(config.long_term_small_model, "qwen3.5-flash-2026-02-23")
+        self.assertEqual(config.long_term_large_model, "qwen3.5-flash-2026-02-23")
 
     def test_config_keeps_llm_api_key_as_compatibility_fallback(self):
         root = Path(self.temp.name)
@@ -773,6 +775,7 @@ class MemorySystemTests(unittest.TestCase):
             config = MemoryConfig.from_env(env_path)
         self.assertEqual(config.llm_api_key, "sk-legacy-key")
         self.assertEqual(config.llm_api_key_source, "LLM_API_KEY")
+        self.assertEqual(config.llm_model, "qwen3.5-flash-2026-02-23")
         self.assertEqual(config.preference_extractor_api_key, "sk-legacy-key")
         self.assertEqual(config.preference_extractor_api_key_source, "LLM_API_KEY")
 
