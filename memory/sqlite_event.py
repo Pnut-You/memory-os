@@ -256,6 +256,7 @@ class SQLiteEventStore:
         self._ensure_column("user_preferences", "reason_zh", "TEXT")
         self._ensure_column("user_preferences", "scope", "TEXT NOT NULL DEFAULT 'user'")
         self._ensure_column("user_preferences", "device_id", "TEXT NOT NULL DEFAULT 'legacy-unassigned'")
+        self._migrate_primary_preferences_to_user_scope()
         self._ensure_preference_device_indexes()
         self._ensure_column("events", "session_id", "TEXT")
         self._conn.execute(
@@ -1283,7 +1284,10 @@ class SQLiteEventStore:
         device_id: str | None = None,
     ) -> int | None:
         now = iso_now()
-        preference_device_id = device_id or LEGACY_USER_ID
+        primary_keys = {"profile.occupation", "preference.likes", "preference.dislikes"}
+        preference_device_id = LEGACY_USER_ID if preference_key in primary_keys else (device_id or LEGACY_USER_ID)
+        if preference_key in primary_keys:
+            scope = "user"
         value_type = str(value.get("type") or "json")
         value_json = self._json(value)
         target_status = status or ("active" if source_type == "explicit" and confidence >= 0.85 else "candidate")
@@ -1421,7 +1425,8 @@ class SQLiteEventStore:
         device_id: str | None = None,
     ) -> None:
         value_json = self._json(value) if value is not None else None
-        preference_device_id = device_id or LEGACY_USER_ID
+        primary_keys = {"profile.occupation", "preference.likes", "preference.dislikes"}
+        preference_device_id = LEGACY_USER_ID if preference_key in primary_keys else (device_id or LEGACY_USER_ID)
         if preference_key in {"preference.likes", "preference.dislikes"} and value is None:
             return
         with self._lock:
@@ -1598,6 +1603,55 @@ class SQLiteEventStore:
             ).fetchall()
         return [self._decode_row(row, ("value_json",)) for row in rows]
 
+    def list_long_term_facts(
+        self,
+        user_id: str,
+        preference_key: str | None = None,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        keys = ("profile.occupation", "preference.likes", "preference.dislikes")
+        params: list[Any] = [user_id, LEGACY_USER_ID]
+        where = "WHERE user_id=? AND device_id=? AND status='active' AND scope='user'"
+        if preference_key is not None:
+            if preference_key not in keys:
+                return []
+            where += " AND preference_key=?"
+            params.append(preference_key)
+        else:
+            where += " AND preference_key IN (?,?,?)"
+            params.extend(keys)
+        params.append(max(1, limit))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM user_preferences {where} ORDER BY updated_at DESC,id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._decode_row(row, ("value_json",)) for row in rows]
+
+    def list_primary_preferences(
+        self,
+        user_id: str,
+        status: str | None = None,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = [user_id, LEGACY_USER_ID]
+        where = (
+            "WHERE user_id=? AND device_id=? AND scope='user' "
+            "AND preference_key IN ('profile.occupation','preference.likes','preference.dislikes')"
+        )
+        if status:
+            where += " AND status=?"
+            params.append(status)
+        params.append(max(1, limit))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM user_preferences {where} ORDER BY updated_at DESC,id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._decode_row(row, ("value_json",)) for row in rows]
+
     def list_preference_evidence(
         self,
         user_id: str,
@@ -1612,7 +1666,8 @@ class SQLiteEventStore:
         params.append(limit)
         with self._lock:
             rows = self._conn.execute(
-                """SELECT e.*, p.preference_key, p.display_text_zh, ev.content AS source_content
+                """SELECT e.*, p.preference_key, p.device_id AS preference_device_id,
+                p.display_text_zh, ev.content AS source_content
                 FROM preference_evidence e
                 JOIN user_preferences p ON p.id=e.preference_id
                 JOIN events ev ON ev.id=e.event_id
@@ -2065,6 +2120,43 @@ class SQLiteEventStore:
                 """CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_preference_job
                 ON memory_jobs(user_id, device_id, job_type)
                 WHERE job_type='preference_extraction' AND status IN ('pending','running')"""
+            )
+            self._conn.commit()
+
+    def _migrate_primary_preferences_to_user_scope(self) -> None:
+        keys = ("profile.occupation", "preference.likes", "preference.dislikes")
+        placeholders = ",".join("?" for _ in keys)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT id,user_id,preference_key,value_json,status,updated_at
+                FROM user_preferences
+                WHERE preference_key IN ({placeholders})
+                ORDER BY updated_at DESC,id DESC""",
+                keys,
+            ).fetchall()
+            active_seen: set[tuple[str, str, str]] = set()
+            superseded: list[int] = []
+            for row in rows:
+                if str(row["status"]) != "active":
+                    continue
+                key = str(row["preference_key"])
+                value_identity = "single" if key == "profile.occupation" else str(row["value_json"])
+                identity = (str(row["user_id"]), key, value_identity)
+                if identity in active_seen:
+                    superseded.append(int(row["id"]))
+                else:
+                    active_seen.add(identity)
+            if superseded:
+                marks = ",".join("?" for _ in superseded)
+                self._conn.execute(
+                    f"UPDATE user_preferences SET status='superseded',updated_at=? WHERE id IN ({marks})",
+                    [iso_now(), *superseded],
+                )
+            self._conn.execute(
+                f"""UPDATE user_preferences
+                SET device_id=?,scope='user'
+                WHERE preference_key IN ({placeholders})""",
+                (LEGACY_USER_ID, *keys),
             )
             self._conn.commit()
 

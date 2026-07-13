@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -59,6 +60,13 @@ PREFERENCE_KEYWORDS = (
 )
 
 
+class PreferenceExtractionError(RuntimeError):
+    def __init__(self, message: str, attempts: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.fallback_used = len(attempts) > 1
+
+
 @dataclass(slots=True)
 class PreferenceEvidenceModel:
     event_id: int
@@ -92,6 +100,9 @@ class PreferenceExtractionResult:
     schema_version: str
     user_id: str
     preferences: list[ExtractedPreferenceModel] = field(default_factory=list)
+    raw_outputs: list[dict[str, Any]] = field(default_factory=list)
+    validated_outputs: list[dict[str, Any]] = field(default_factory=list)
+    fallback_used: bool = False
 
     @classmethod
     def model_validate(cls, value: dict[str, Any], default_user_id: str = "") -> "PreferenceExtractionResult":
@@ -252,13 +263,22 @@ class PreferenceExtractor:
         api_key: str,
         base_url: str,
         model: str,
+        mode: str = "small",
+        small_model: str = "qwen3.5-flash-2026-02-23",
+        large_model: str = "qwen3.5-flash-2026-02-23",
         prompt_version: str = "preferences-v1",
     ) -> None:
         self.enabled = enabled
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.prompt_version = prompt_version
+        if mode not in {"small", "hybrid", "large"}:
+            raise ValueError("preference extractor mode must be small, hybrid, or large")
+        self.mode = mode
+        self.action_model = model
+        self.small_model = small_model
+        self.large_model = large_model
+        self.model = large_model if mode == "large" else small_model
+        self.prompt_version = "preferences-v2-strict"
 
     @property
     def configured(self) -> bool:
@@ -270,84 +290,155 @@ class PreferenceExtractor:
             "configured": self.configured,
             "base_url": self.base_url,
             "model": self.model,
+            "mode": self.mode,
+            "small_model": self.small_model,
+            "large_model": self.large_model,
         }
 
-    def extract(self, user_id: str, events: list[dict[str, Any]], existing_preferences: list[dict[str, Any]] | None = None) -> PreferenceExtractionResult:
+    def extract(
+        self,
+        user_id: str,
+        events: dict[str, Any],
+        existing_preferences: list[dict[str, Any]] | None = None,
+    ) -> PreferenceExtractionResult:
         if not self.configured:
-            return PreferenceExtractionResult(schema_version="1.0", user_id=user_id, preferences=[])
-        compact_existing = [
-            {
-                "preference_key": item.get("preference_key"),
-                "category": item.get("category"),
-                "value_json": item.get("value_json"),
-                "display_text_zh": item.get("display_text_zh"),
-                "status": item.get("status"),
-                "confidence": item.get("confidence"),
-                "strength": item.get("strength"),
-            }
-            for item in (existing_preferences or [])[:30]
-        ]
+            return PreferenceExtractionResult(schema_version="2.0", user_id=user_id, preferences=[])
+        preferences: list[ExtractedPreferenceModel] = []
+        raw_outputs: list[dict[str, Any]] = []
+        validated_outputs: list[dict[str, Any]] = []
+        fallback_used = False
+        for event in self._source_user_events(events):
+            event_id = int(event.get("event_id") or event.get("id") or 0)
+            source_text = str(event.get("text") or event.get("content") or "").strip()
+            if not source_text or not self._may_contain_target_preference(source_text):
+                continue
+            try:
+                candidate, attempts, used_fallback = self._extract_one(source_text)
+            except PreferenceExtractionError as exc:
+                attempts = [{"event_id": event_id, **attempt} for attempt in exc.attempts]
+                raise PreferenceExtractionError(str(exc), attempts) from exc
+            raw_outputs.extend({"event_id": event_id, **attempt} for attempt in attempts)
+            fallback_used = fallback_used or used_fallback
+            validated_outputs.append({"event_id": event_id, **candidate})
+            if candidate["type"] == "none":
+                continue
+            key = {
+                "occupation": "profile.occupation",
+                "likes": "preference.likes",
+                "dislikes": "preference.dislikes",
+            }[candidate["type"]]
+            extracted_value = str(candidate["value"])
+            preferences.append(
+                ExtractedPreferenceModel(
+                    preference_key=key,
+                    category="profile" if candidate["type"] == "occupation" else "preference",
+                    value={
+                        "type": "string",
+                        "value": extracted_value,
+                        "code": extracted_value,
+                        "label_zh": extracted_value,
+                    },
+                    display_text_zh=extracted_value,
+                    polarity="avoid" if candidate["type"] == "dislikes" else "prefer",
+                    durability="persistent",
+                    strength=float(candidate["confidence"]),
+                    confidence=float(candidate["confidence"]),
+                    source_type="explicit",
+                    evidence=[PreferenceEvidenceModel(event_id=event_id, text=str(candidate["evidence"]))],
+                    scope="user",
+                )
+            )
+        return PreferenceExtractionResult(
+            schema_version="2.0",
+            user_id=user_id,
+            preferences=preferences,
+            raw_outputs=raw_outputs,
+            validated_outputs=validated_outputs,
+            fallback_used=fallback_used,
+        )
+
+    @staticmethod
+    def _source_user_events(context: dict[str, Any]) -> list[dict[str, Any]]:
+        source = context.get("source_user_events")
+        if isinstance(source, list):
+            return [item for item in source if isinstance(item, dict)]
+        result: list[dict[str, Any]] = []
+        for turn in context.get("recent_turns") or []:
+            for message in turn.get("messages") or []:
+                if isinstance(message, dict) and message.get("role") == "user":
+                    result.append(message)
+        return result
+
+    @staticmethod
+    def _may_contain_target_preference(text: str) -> bool:
+        return bool(
+            re.search(
+                r"职业|工作|身份|从事|一名|我是|我做|喜欢|喜爱|爱好|偏爱|偏好|合胃口|"
+                r"不喜欢|不爱|讨厌|受不了|不舒服|避开|不要有",
+                text,
+            )
+        )
+
+    def _extract_one(self, source_text: str) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+        models = [self.large_model] if self.mode == "large" else [self.small_model]
+        if self.mode == "hybrid":
+            models.append(self.large_model)
+        attempts: list[dict[str, Any]] = []
+        last_error = "unknown validation error"
+        for index, model in enumerate(models):
+            raw = ""
+            try:
+                raw = self._request_strict_extraction(model, source_text)
+                candidate = self._validate_strict_output(raw, source_text)
+                attempts.append({"model": model, "raw_output": raw, "validation_error": ""})
+                return candidate, attempts, index > 0
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                attempts.append({"model": model, "raw_output": raw, "validation_error": last_error})
+        raise PreferenceExtractionError(
+            f"preference extraction validation failed: {last_error}",
+            attempts,
+        )
+
+    def _request_strict_extraction(self, model: str, source_text: str) -> str:
         payload = {
-            "model": self.model,
-            "temperature": 0.1,
-            "max_tokens": 1600,
+            "model": model,
+            "enable_thinking": False,
+            "temperature": 0,
+            "max_tokens": 160,
             "response_format": {"type": "json_object"},
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        "你是机器狗 Memory OS 的用户偏好抽取器。只输出严格 JSON，不要 Markdown。"
-                        "结构化偏好记忆优先只写三类：profile.occupation、preference.likes、preference.dislikes。"
-                        "同时支持 habit.routine、constraint.stable、relationship.person、default_behavior.preference。"
-                        "职业只从明确身份/职业表述抽取，例如我是摄影师、我的职业是产品经理。"
-                        "喜欢用于明确稳定喜欢的事物，例如我喜欢摄影、我喜欢周杰伦。"
-                        "明确不喜欢用于明确负向偏好，例如我不喜欢吵闹、以后不要摇滚。"
-                        "如果 rolling_summary 里有用户不喜欢/喜欢/职业信息，也必须结合 summary_evidence_events 回溯原始证据并抽取。"
-                        "单次命令不要写入长期偏好；未知旧细分类不要优先使用，除非三类完全无法表达。"
+                        "你是长期偏好抽取器。只分析当前这一条用户原文。"
+                        "只输出一个严格 JSON 对象，不要 Markdown、解释或额外字段。"
+                        "type 只能是 occupation、likes、dislikes、none。"
+                        "occupation 表示用户明确陈述的职业或工作身份；"
+                        "likes 表示用户明确喜欢、偏好或正面接受的对象；"
+                        "dislikes 表示用户明确不喜欢、讨厌、避开或感到不舒服的对象。"
+                        "“不太喜欢”属于 dislikes，“偏好里加上”属于 likes，“偏好里不要有”属于 dislikes。"
+                        "原文明示以上事实时不得返回 none。"
+                        "value 必须逐字来自当前原文，evidence 必须是包含 value 的对应原句。"
+                        "evidence 必须从当前原文逐字复制，不得改写人称、标点或任何字符。"
+                        "四个字段始终都必须输出，confidence 始终必须是 0 到 1 的数字。"
+                        "无法从原文确定时输出 type=none，value 和 evidence 为空字符串。"
                     ),
                 },
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
-	                            "schema_version": "1.0",
-		                            "user_id": user_id,
-	                            "allowed_keys": PREFERENCE_REGISTRY,
-	                            "preference_context": events,
-	                            "existing_preferences": compact_existing,
-	                            "output_schema": {
-	                                "schema_version": "1.0",
-	                                "user_id": user_id,
-                                "preferences": [
-                                    {
-                                        "preference_key": "profile.occupation/preference.likes/preference.dislikes 优先；未知用 other",
-                                        "category": "profile/preference",
-                                        "value": {"type": "enum/string/number/json", "code": "machine_readable", "label_zh": "中文值"},
-                                        "display_text_zh": "中文偏好描述",
-                                        "polarity": "prefer/avoid",
-                                        "durability": "persistent/temporary",
-                                        "strength": "0-1",
-                                        "confidence": "0-1",
-                                        "source_type": "explicit/implicit/action_pattern",
-                                        "scope": "user/user_device",
-                                        "reason_zh": "为什么这是偏好",
-                                        "evidence": [{"event_id": 1, "text": "证据原文", "type": "explicit/action"}],
-                                        "expires_at": None,
-                                        "action": "upsert/revoke",
-                                    }
-                                ],
-	                            },
-                                "rules": [
-                                    "顶层必须是对象，必须包含 schema_version、user_id、preferences。",
-                                    "preferences 必须是数组；没有稳定偏好时返回空数组。",
-                                    "优先使用三类结构化偏好记忆 key，不要把摄影、周杰伦等喜欢的事物写成 other。",
-                                    "evidence 必须优先引用 preference_context.recent_turns、summary_evidence_events 或 action_events 中的真实 event_id。",
-                                    "summary 可以提示应该抽取什么，但 evidence.text 要尽量使用 summary_evidence_events 里的用户原话。",
-                                    "不要输出 Markdown，不要解释。",
-                                ],
-	                        },
-	                        ensure_ascii=False,
-	                    ),
+                            "current_user_text": source_text,
+                            "output_schema": {
+                                "type": "occupation | likes | dislikes | none",
+                                "value": "当前原文中的内容",
+                                "evidence": "当前原文中的对应原句",
+                                "confidence": 0.0,
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
                 },
             ],
         }
@@ -361,17 +452,61 @@ class PreferenceExtractor:
             with urllib.request.urlopen(request, timeout=60) as response:
                 data = json.loads(response.read().decode("utf-8"))
             content = data["choices"][0]["message"]["content"]
-            try:
-                return PreferenceExtractionResult.model_validate_json(content, default_user_id=user_id)
-            except (json.JSONDecodeError, ValueError) as exc:
-                raise RuntimeError(
-                    f"preference extraction validation failed: {exc}; response={content[:500]}"
-                ) from exc
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("empty model output")
+            return content.strip()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"preference extraction http {exc.code}: {body}") from exc
         except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError(f"preference extraction failed: {exc}") from exc
+
+    @staticmethod
+    def _validate_strict_output(raw: str, source_text: str) -> dict[str, Any]:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("output must be a JSON object")
+        required = {"type", "value", "evidence", "confidence"}
+        if set(value) != required:
+            raise ValueError("output fields must exactly match type/value/evidence/confidence")
+        preference_type = value["type"]
+        extracted_value = value["value"]
+        evidence = value["evidence"]
+        confidence = value["confidence"]
+        if preference_type not in {"occupation", "likes", "dislikes", "none"}:
+            raise ValueError("invalid preference type")
+        if not isinstance(extracted_value, str) or not isinstance(evidence, str):
+            raise ValueError("value and evidence must be strings")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+            raise ValueError("confidence must be a number in [0,1]")
+        extracted_value = extracted_value.strip()
+        evidence = evidence.strip()
+        if preference_type == "none":
+            if extracted_value or evidence:
+                raise ValueError("none output must have empty value and evidence")
+            if PreferenceExtractor._has_explicit_preference_signal(source_text):
+                raise ValueError("none is invalid for text with an explicit preference signal")
+        else:
+            if not extracted_value or not evidence:
+                raise ValueError("value and evidence cannot be empty")
+            if extracted_value not in source_text or evidence not in source_text or extracted_value not in evidence:
+                raise ValueError("value and evidence must come from the current user text")
+        return {
+            "type": preference_type,
+            "value": extracted_value,
+            "evidence": evidence,
+            "confidence": float(confidence),
+        }
+
+    @staticmethod
+    def _has_explicit_preference_signal(text: str) -> bool:
+        return bool(
+            re.search(
+                r"职业|工作身份|一名|我做.+工作|喜欢|喜爱|爱好|偏好|合胃口|"
+                r"不.{0,2}喜欢|不爱|讨厌|受不了|不舒服|避开|不要有",
+                text,
+            )
+        )
 
     def extract_action_preferences(
         self,
@@ -381,7 +516,8 @@ class PreferenceExtractor:
         if not self.configured:
             return ActionPreferenceExtractionResult(schema_version="1.0", user_id=user_id, memories=[])
         payload = {
-            "model": self.model,
+            "model": self.action_model,
+            "enable_thinking": False,
             "temperature": 0.1,
             "max_tokens": 1600,
             "response_format": {"type": "json_object"},

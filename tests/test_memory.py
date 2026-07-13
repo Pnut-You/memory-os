@@ -11,11 +11,12 @@ from unittest.mock import patch
 
 from memory import MemoryConfig, MemoryManager, ShortTermMemory
 from memory.migrate import migrate_jsonl
-from memory.preferences import ActionPreferenceExtractionResult, PreferenceExtractionResult
+from memory.preferences import ActionPreferenceExtractionResult, PreferenceExtractionResult, PreferenceExtractor
 from memory.sqlite_event import LEGACY_USER_ID, SQLiteEventStore
 from ui.app import QueryRequest
 from ui.llm import DebugChatLLM
 from ui.router import MemoryDebugRouter
+from evaluation.run_preference_eval import answer_contains_expected
 
 
 class BrokenRedisClient:
@@ -132,6 +133,26 @@ class RouteLLM(FakeLLM):
         return self.reply, {"model": self.model, "event_routes": self.event_routes}
 
 
+class RecallNameLLM(FakeLLM):
+    def complete(self, query, short_term, rolling_summary, user_card, latest_action_sequence=None):
+        self.calls.append(
+            {
+                "query": query,
+                "short_term": short_term,
+                "rolling_summary": rolling_summary,
+                "user_card": user_card,
+                "latest_action_sequence": latest_action_sequence,
+            }
+        )
+        for message in short_term:
+            content = str(message.get("content") or "")
+            marker = "机器狗叫"
+            if marker in content:
+                name = content.split(marker, 1)[1].split("。", 1)[0].split("，", 1)[0].strip()
+                return f"你刚才说机器狗叫{name}。", {"model": self.model}
+        return "你刚才没有提到机器狗的名字。", {"model": self.model}
+
+
 class MemorySystemTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -153,6 +174,30 @@ class MemorySystemTests(unittest.TestCase):
 
     def make_manager(self) -> MemoryManager:
         return MemoryManager.create(self.config, start_scheduler=False)
+
+    def add_short_memory_probe_turns(
+        self,
+        manager: MemoryManager,
+        *,
+        turn_count: int,
+        fact_turn: int,
+        fact_text: str,
+    ) -> None:
+        session_id = None
+        for turn in range(1, turn_count + 1):
+            if turn == fact_turn:
+                user_text = fact_text
+            else:
+                user_text = f"这是第{turn}轮普通短会话。"
+            result = manager.add_conversation_turn(
+                f"short-probe-{turn}",
+                "user-001",
+                "dog-001",
+                user_text,
+                f"第{turn}轮回复。",
+                session_id=session_id,
+            )
+            session_id = result["session_id"]
 
     def test_query_contract_requires_user_id_and_device_id(self):
         payload = QueryRequest(user_id="user-1", device_id="dog-1", query="你好")
@@ -234,7 +279,7 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_long_term_preferences_do_not_cross_devices(self):
+    def test_primary_long_term_preferences_follow_user_across_devices(self):
         manager = self.make_manager()
         try:
             manager.events.upsert_preference(
@@ -248,10 +293,11 @@ class MemorySystemTests(unittest.TestCase):
                 device_id="dog-001",
             )
             manager.rebuild_user_card("user-001", "dog-001")
-            self.assertEqual(len(manager.events.list_preferences("user-001", status="active", device_id="dog-001")), 1)
+            self.assertEqual(len(manager.events.list_long_term_facts("user-001", "preference.likes")), 1)
             self.assertEqual(manager.events.list_preferences("user-001", status="active", device_id="dog-002"), [])
+            manager.rebuild_user_card("user-001", "dog-002")
             self.assertIsNotNone(manager.get_user_card("user-001", "dog-001"))
-            self.assertIsNone(manager.get_user_card("user-001", "dog-002"))
+            self.assertIsNotNone(manager.get_user_card("user-001", "dog-002"))
         finally:
             manager.close()
 
@@ -285,8 +331,14 @@ class MemorySystemTests(unittest.TestCase):
             dog1 = router.debug_user("user-001", "dog-001")
             dog2 = router.debug_user("user-001", "dog-002")
 
-            self.assertEqual([item["display_text_zh"] for item in dog1["active_preferences"]], ["喜欢飞盘"])
-            self.assertEqual([item["display_text_zh"] for item in dog2["active_preferences"]], ["喜欢苹果"])
+            self.assertEqual(
+                {item["display_text_zh"] for item in dog1["active_preferences"]},
+                {"喜欢飞盘", "喜欢苹果"},
+            )
+            self.assertEqual(
+                {item["display_text_zh"] for item in dog2["active_preferences"]},
+                {"喜欢飞盘", "喜欢苹果"},
+            )
             self.assertEqual(dog1["user_card"]["device_id"], "dog-001")
             self.assertEqual(dog2["user_card"]["device_id"], "dog-002")
         finally:
@@ -711,7 +763,9 @@ class MemorySystemTests(unittest.TestCase):
         self.assertEqual(config.preference_extractor_api_key, "sk-dashscope-key")
         self.assertEqual(config.preference_extractor_api_key_source, "DASHSCOPE_API_KEY")
         self.assertEqual(config.preference_extractor_base_url, "https://dashscope.aliyuncs.com/compatible-mode/v1")
-        self.assertEqual(config.preference_extractor_model, "qwen3.7-max")
+        self.assertEqual(config.preference_extractor_model, "qwen3.5-flash-2026-02-23")
+        self.assertEqual(config.long_term_small_model, "qwen3.5-flash-2026-02-23")
+        self.assertEqual(config.long_term_large_model, "qwen3.5-flash-2026-02-23")
 
     def test_config_keeps_llm_api_key_as_compatibility_fallback(self):
         root = Path(self.temp.name)
@@ -721,6 +775,7 @@ class MemorySystemTests(unittest.TestCase):
             config = MemoryConfig.from_env(env_path)
         self.assertEqual(config.llm_api_key, "sk-legacy-key")
         self.assertEqual(config.llm_api_key_source, "LLM_API_KEY")
+        self.assertEqual(config.llm_model, "qwen3.5-flash-2026-02-23")
         self.assertEqual(config.preference_extractor_api_key, "sk-legacy-key")
         self.assertEqual(config.preference_extractor_api_key_source, "LLM_API_KEY")
 
@@ -737,6 +792,165 @@ class MemorySystemTests(unittest.TestCase):
         self.assertEqual(status["api_key_hint"]["length"], len("2783-invalid"))
         with self.assertRaisesRegex(RuntimeError, "LLM_API_KEY"):
             llm.complete("你好", [], "", {})
+
+    def test_debug_llm_does_not_change_shared_prompt_for_long_term_verification(self):
+        llm = DebugChatLLM("", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen3.7-plus")
+        empty_messages = llm.build_messages("用户的职业是什么？", [], "", {})
+        empty_prompt = "\n".join(item["content"] for item in empty_messages)
+        self.assertNotIn("长期记忆事实", empty_prompt)
+
+        messages = llm.build_messages(
+            "用户的职业是什么？",
+            [{"role": "user", "content": "当前会话事实"}],
+            "",
+            {
+                "preferences": [
+                    {"key": "profile.occupation", "value": "programmer", "label_zh": "职业"},
+                    {"key": "preference.likes", "value": "羽毛球", "label_zh": "喜欢羽毛球"},
+                    {"key": "preference.dislikes", "value": "香菜", "label_zh": "不喜欢香菜"},
+                ]
+            },
+        )
+        prompt = "\n".join(item["content"] for item in messages)
+        self.assertNotIn("长期记忆事实", prompt)
+        self.assertIn("当前会话事实", prompt)
+
+    def test_preference_verification_match_allows_minor_function_words(self):
+        self.assertTrue(answer_contains_expected("我记得您不喜欢吵闹的环境。", "吵闹环境"))
+        self.assertTrue(answer_contains_expected("根据我的记忆，您不喜欢刺耳的提示音。", "刺耳提示音"))
+        self.assertFalse(answer_contains_expected("你的职业是医生。", "程序员"))
+
+    def test_strict_preference_output_rejects_value_not_in_current_text(self):
+        raw = json.dumps(
+            {"type": "occupation", "value": "程序员", "evidence": "我的职业是程序员", "confidence": 0.99},
+            ensure_ascii=False,
+        )
+        with self.assertRaisesRegex(ValueError, "current user text"):
+            PreferenceExtractor._validate_strict_output(raw, "我的职业是医生")
+
+    def test_hybrid_preference_extractor_falls_back_after_validation_failure(self):
+        extractor = PreferenceExtractor(
+            enabled=True,
+            api_key="test",
+            base_url="https://example.test/v1",
+            model="legacy-large",
+            mode="hybrid",
+            small_model="small-model",
+            large_model="large-model",
+        )
+        invalid = json.dumps(
+            {"type": "likes", "value": "摄影", "evidence": "我喜欢摄影", "confidence": 0.9},
+            ensure_ascii=False,
+        )
+        valid = json.dumps(
+            {"type": "likes", "value": "羽毛球", "evidence": "我喜欢羽毛球", "confidence": 0.95},
+            ensure_ascii=False,
+        )
+        with patch.object(extractor, "_request_strict_extraction", side_effect=[invalid, valid]) as request:
+            result = extractor.extract(
+                "u",
+                {"source_user_events": [{"event_id": 1, "text": "我喜欢羽毛球"}]},
+            )
+        self.assertEqual(request.call_args_list[0].args[0], "small-model")
+        self.assertEqual(request.call_args_list[1].args[0], "large-model")
+        self.assertTrue(result.fallback_used)
+        self.assertEqual(result.preferences[0].value["value"], "羽毛球")
+
+    def test_valid_none_does_not_trigger_hybrid_fallback(self):
+        extractor = PreferenceExtractor(
+            enabled=True,
+            api_key="test",
+            base_url="https://example.test/v1",
+            model="legacy-large",
+            mode="hybrid",
+        )
+        raw = json.dumps({"type": "none", "value": "", "evidence": "", "confidence": 0.0})
+        with patch.object(extractor, "_request_strict_extraction", return_value=raw) as request:
+            result = extractor.extract(
+                "u",
+                {"source_user_events": [{"event_id": 1, "text": "我是来聊天的"}]},
+            )
+        self.assertEqual(request.call_count, 1)
+        self.assertFalse(result.fallback_used)
+        self.assertEqual(result.preferences, [])
+
+    def test_long_term_fact_query_returns_sqlite_values_without_calling_llm(self):
+        manager = self.make_manager()
+        llm = FakeLLM()
+        router = MemoryDebugRouter(manager, llm)
+        try:
+            for value in ("羽毛球", "电子音乐"):
+                manager.events.upsert_preference(
+                    "u",
+                    "preference.likes",
+                    "preference",
+                    {"type": "string", "value": value, "code": value, "label_zh": value},
+                    value,
+                    [],
+                    confidence=0.95,
+                    device_id="dog-1",
+                )
+            result = router.submit("u", "dog-2", "根据长期记忆，你记得我喜欢什么？", debug=True)
+            self.assertEqual(set(result["assistant_reply"].split("、")), {"羽毛球", "电子音乐"})
+            self.assertEqual(llm.calls, [])
+            self.assertEqual(result["model"], "sqlite-long-term-facts")
+            self.assertEqual(result["debug"]["retrieved_long_term_facts"]["field"], "likes")
+            self.assertEqual(manager.events.list_jobs(job_type="preference_extraction"), [])
+        finally:
+            manager.close()
+
+    def test_short_term_fact_question_is_not_intercepted(self):
+        manager = self.make_manager()
+        llm = FakeLLM()
+        router = MemoryDebugRouter(manager, llm)
+        try:
+            result = router.submit("u", "dog-1", "我刚才说我喜欢什么？")
+            self.assertEqual(result["assistant_reply"], "好的，我会优先选择安静的路线。")
+            self.assertEqual(len(llm.calls), 1)
+        finally:
+            manager.close()
+
+    def test_required_long_term_values_do_not_cross_users_or_fields(self):
+        manager = self.make_manager()
+        try:
+            facts = [
+                ("previous-user", "profile.occupation", "程序员"),
+                ("current-user", "profile.occupation", "医生"),
+                ("current-user", "preference.likes", "羽毛球"),
+                ("current-user", "preference.likes", "电子音乐"),
+                ("current-user", "preference.dislikes", "香菜"),
+            ]
+            for user_id, key, value in facts:
+                manager.events.upsert_preference(
+                    user_id,
+                    key,
+                    "profile" if key == "profile.occupation" else "preference",
+                    {"type": "string", "value": value, "code": value, "label_zh": value},
+                    value,
+                    [],
+                    confidence=0.95,
+                    device_id="dog-1",
+                )
+            self.assertEqual(manager.answer_long_term_fact("current-user", "occupation")[0], "医生")
+            self.assertEqual(
+                set(manager.answer_long_term_fact("current-user", "likes")[0].split("、")),
+                {"羽毛球", "电子音乐"},
+            )
+            self.assertEqual(manager.answer_long_term_fact("current-user", "dislikes")[0], "香菜")
+            self.assertEqual(manager.answer_long_term_fact("missing-user", "likes")[0], "未记录")
+        finally:
+            manager.close()
+
+    def test_delete_user_memory_removes_all_device_user_cards(self):
+        manager = self.make_manager()
+        try:
+            manager.redis.set_json(manager.redis.user_card_key("u", "dog-1"), {"value": 1}, 60)
+            manager.redis.set_json(manager.redis.user_card_key("u", "dog-2"), {"value": 2}, 60)
+            manager.delete_user_memory("u")
+            self.assertIsNone(manager.get_user_card("u", "dog-1"))
+            self.assertIsNone(manager.get_user_card("u", "dog-2"))
+        finally:
+            manager.close()
 
     def test_same_preference_increments_evidence_count(self):
         manager = self.make_manager()
@@ -1066,6 +1280,71 @@ class MemorySystemTests(unittest.TestCase):
             self.assertTrue(manager.wait_for_summaries())
             self.assertIsNone(manager.events.latest_summary("u", "d"))
             self.assertEqual(capture.calls, [])
+        finally:
+            manager.close()
+
+    def test_ten_turn_session_enters_prompt_without_truncating_first_fact(self):
+        manager = self.make_manager()
+        llm = RecallNameLLM()
+        router = MemoryDebugRouter(manager, llm)
+        try:
+            self.add_short_memory_probe_turns(
+                manager,
+                turn_count=10,
+                fact_turn=1,
+                fact_text="我的机器狗叫小黑。",
+            )
+            result = router.submit("user-001", "dog-001", "机器狗叫什么？", debug=True)
+            prompt_text = "\n".join(item["content"] for item in result["debug"]["prompt_messages"])
+            self.assertIn("小黑", prompt_text)
+            self.assertIn("小黑", result["assistant_reply"])
+            self.assertEqual(len(llm.calls[0]["short_term"]), 20)
+            self.assertIn("小黑", llm.calls[0]["short_term"][0]["content"])
+        finally:
+            manager.close()
+
+    def test_fourteen_turn_session_enters_prompt_without_truncating_middle_fact(self):
+        manager = self.make_manager()
+        llm = RecallNameLLM()
+        router = MemoryDebugRouter(manager, llm)
+        try:
+            self.add_short_memory_probe_turns(
+                manager,
+                turn_count=14,
+                fact_turn=4,
+                fact_text="我的机器狗叫可乐。",
+            )
+            result = router.submit("user-001", "dog-001", "机器狗叫什么？", debug=True)
+            prompt_text = "\n".join(item["content"] for item in result["debug"]["prompt_messages"])
+            self.assertIn("可乐", prompt_text)
+            self.assertIn("可乐", result["assistant_reply"])
+            self.assertEqual(len(llm.calls[0]["short_term"]), 28)
+            self.assertTrue(any("可乐" in item["content"] for item in llm.calls[0]["short_term"]))
+        finally:
+            manager.close()
+
+    def test_twenty_turn_session_under_token_trigger_enters_prompt_without_summary_or_truncation(self):
+        manager = self.make_manager()
+        capture = CaptureSummarizer()
+        manager.summarizer = capture
+        llm = RecallNameLLM()
+        router = MemoryDebugRouter(manager, llm)
+        try:
+            self.add_short_memory_probe_turns(
+                manager,
+                turn_count=20,
+                fact_turn=1,
+                fact_text="我的机器狗叫小黑。",
+            )
+            result = router.submit("user-001", "dog-001", "机器狗叫什么？", debug=True)
+            self.assertLess(result["debug"]["prompt_token_count"], 5000)
+            self.assertIsNone(manager.events.latest_summary("user-001", "dog-001"))
+            self.assertEqual(capture.calls, [])
+            self.assertEqual(len(llm.calls[0]["short_term"]), 40)
+            prompt_text = "\n".join(item["content"] for item in result["debug"]["prompt_messages"])
+            for turn in range(1, 21):
+                expected = "我的机器狗叫小黑。" if turn == 1 else f"这是第{turn}轮普通短会话。"
+                self.assertIn(expected, prompt_text)
         finally:
             manager.close()
 

@@ -114,6 +114,9 @@ class MemoryManager:
             api_key=config.preference_extractor_api_key,
             base_url=config.preference_extractor_base_url,
             model=config.preference_extractor_model,
+            mode=config.long_term_extractor_mode,
+            small_model=config.long_term_small_model,
+            large_model=config.long_term_large_model,
         )
         manager = cls(
             short,
@@ -224,22 +227,29 @@ class MemoryManager:
         session = self.resolve_session(user_id, device_id, timestamp=timestamp, session_id=session_id)
         local_date = str(session.get("local_date") or self._local_date(timestamp or iso_now()))
         session_id = str(session["session_id"])
-        bundle = self.redis.get_context_bundle(user_id, device_id, session_id, recent_limit=10)
+        bundle = self.redis.get_context_bundle(user_id, device_id, session_id, recent_limit=1)
         summary = bundle["summary"]
         if summary and str(summary.get("local_date") or "") != local_date:
             summary = None
         summary = summary or self._restore_summary(user_id, device_id, local_date, session_id)
-        user_card = bundle["user_card"] or self.restore_user_card(user_id, device_id)
-        recent = self.redis.get_session_conversation(user_id, device_id, session_id, limit=10)
+        cached_user_card = bundle["user_card"]
+        if cached_user_card and int(cached_user_card.get("long_term_scope_version", 0) or 0) != 2:
+            cached_user_card = None
+        user_card = cached_user_card or self.restore_user_card(user_id, device_id)
+        latest_summary_id = int((summary or {}).get("compacted_through_event_id", 0) or 0)
+        recent = [
+            item
+            for item in self.redis.get_session_conversation(user_id, device_id, session_id)
+            if int(item.get("id") or 0) > latest_summary_id
+        ]
         if not recent:
-            latest_summary_id = int((summary or {}).get("compacted_through_event_id", 0) or 0)
             recent = self.events.message_range(
                 user_id,
                 device_id,
                 latest_summary_id,
-                self.short_memory_retain_recent_turns * 2,
+                10000,
                 session_id=session_id,
-            )[-10:]
+            )
             if recent:
                 self.redis.append_session_conversation(
                     user_id,
@@ -247,7 +257,7 @@ class MemoryManager:
                     session_id,
                     recent,
                     ttl_seconds=self.session_ttl_seconds,
-                    max_items=20,
+                    max_items=None,
                 )
         latest_action = self.events.latest_action_sequence(user_id, device_id)
         return {
@@ -259,7 +269,7 @@ class MemoryManager:
             "rolling_summary": (summary or {}).get("summary_text", ""),
             "summary_version": int((summary or {}).get("version", 0) or 0),
             "summary_pending": self._conversation_states.get((user_id, device_id, session_id, local_date), _ConversationState()).summary_pending,
-            "recent_messages": recent[-10:],
+            "recent_messages": recent,
             "latest_action_sequence": latest_action,
         }
 
@@ -274,6 +284,7 @@ class MemoryManager:
         model_event_routes: list[dict[str, Any]] | None = None,
         session_id: str | None = None,
         prompt_token_count: int | None = None,
+        schedule_preference_extraction: bool = True,
     ) -> dict[str, Any]:
         timestamp = timestamp or iso_now()
         session = self.resolve_session(user_id, device_id, timestamp=timestamp, session_id=session_id)
@@ -296,7 +307,7 @@ class MemoryManager:
             session["session_id"],
             messages,
             ttl_seconds=self.session_ttl_seconds,
-            max_items=max(self.short_memory_summary_min_turns, self.short_memory_retain_recent_turns) * 2,
+            max_items=None,
         )
         routed: dict[str, Any] = {}
         if model_event_routes:
@@ -321,7 +332,7 @@ class MemoryManager:
             memory_date,
             prompt_token_count=prompt_token_count,
         )
-        if user_id != "anonymous":
+        if user_id != "anonymous" and schedule_preference_extraction:
             self._maybe_schedule_preference(
                 user_id,
                 device_id,
@@ -476,11 +487,65 @@ class MemoryManager:
         ][:limit]
         return {"user_card": card, "events": events, "preferences": active}
 
+    def get_long_term_facts(self, user_id: str, field: str) -> dict[str, Any]:
+        key_by_field = {
+            "occupation": "profile.occupation",
+            "likes": "preference.likes",
+            "dislikes": "preference.dislikes",
+        }
+        key = key_by_field.get(field)
+        if key is None:
+            raise ValueError("field must be occupation, likes, or dislikes")
+        rows = self.events.list_long_term_facts(user_id, key, limit=100)
+        values: list[str] = []
+        for row in rows:
+            value_json = row.get("value_json") or {}
+            value = ""
+            if isinstance(value_json, dict):
+                for name in ("value", "label_zh", "code"):
+                    candidate = value_json.get(name)
+                    if isinstance(candidate, str) and candidate.strip():
+                        value = candidate.strip()
+                        break
+            value = value or str(row.get("display_text_zh") or "").strip()
+            if value and value not in values:
+                values.append(value)
+        if field == "occupation":
+            values = values[:1]
+        return {"user_id": user_id, "field": field, "preference_key": key, "values": values}
+
+    def answer_long_term_fact(self, user_id: str, field: str) -> tuple[str, dict[str, Any]]:
+        facts = self.get_long_term_facts(user_id, field)
+        values = facts["values"]
+        return ("、".join(values) if values else "未记录"), facts
+
+    @staticmethod
+    def classify_long_term_fact_query(query: str) -> str | None:
+        text = "".join(str(query).split())
+        if not text or any(marker in text for marker in ("刚才", "当前会话", "这次对话")):
+            return None
+        if not any(marker in text for marker in ("长期记忆", "你记得", "记忆中", "记得我")):
+            return None
+        if not any(marker in text for marker in ("什么", "哪些", "吗", "?", "？")):
+            return None
+        if "不喜欢" in text or "讨厌" in text:
+            return "dislikes"
+        if "职业" in text or "工作" in text:
+            return "occupation"
+        if "喜欢" in text or "爱好" in text:
+            return "likes"
+        return None
+
     def get_user_card(self, user_id: str, device_id: str | None = None) -> dict[str, Any] | None:
         return self.redis.get_json(self.redis.user_card_key(user_id, device_id))
 
     def restore_user_card(self, user_id: str, device_id: str | None = None) -> dict[str, Any] | None:
-        preferences = self.events.list_preferences(user_id, status="active", limit=15, device_id=device_id)
+        preferences = self.events.list_preferences(user_id, status="active", limit=100, device_id=device_id)
+        user_facts = self.events.list_long_term_facts(user_id, limit=100)
+        target_keys = {"profile.occupation", "preference.likes", "preference.dislikes"}
+        preferences = user_facts + [
+            item for item in preferences if item.get("preference_key") not in target_keys
+        ]
         if not preferences:
             return None
         card = self._build_user_card(user_id, preferences, device_id)
@@ -564,6 +629,9 @@ class MemoryManager:
                         "attempts": attempts,
                         "final": attempts >= self.preference_extract_max_attempts,
                         "error": str(exc),
+                        "extractor_raw_output": getattr(exc, "attempts", []),
+                        "extractor_validated_output": [],
+                        "fallback_used": bool(getattr(exc, "fallback_used", False)),
                     }
                 )
         return result
@@ -979,7 +1047,7 @@ class MemoryManager:
         return self.events.get_device_history(device_id, limit)
 
     def delete_user_memory(self, user_id: str) -> dict[str, int]:
-        self.redis.delete_key(self.redis.user_card_key(user_id))
+        self.redis.delete_user_cards(user_id)
         self.redis.delete_key(self.redis.user_preferences_key(user_id))
         return self.events.delete_user_memory(user_id)
 
@@ -1721,6 +1789,9 @@ class MemoryManager:
         model_stored = 0
         for pref in model_preferences:
             key, category = normalize_preference_key(pref.preference_key)
+            preference_device_id = None if key in {
+                "profile.occupation", "preference.likes", "preference.dislikes"
+            } else (device_id or None)
             seen_preference_keys.add(
                 (
                     key,
@@ -1728,13 +1799,15 @@ class MemoryManager:
                 )
             )
             if pref.action == "revoke":
-                self.events.revoke_preference(user_id, key, pref.value, device_id=device_id or None)
+                self.events.revoke_preference(user_id, key, pref.value, device_id=preference_device_id)
                 changed = True
                 upserted += 1
                 continue
             status = None
             if key == "other":
                 status = "candidate"
+            elif getattr(result, "schema_version", "") == "2.0":
+                status = "active"
             pref_id = self.events.upsert_preference(
                 user_id,
                 key,
@@ -1753,13 +1826,14 @@ class MemoryManager:
                 reason_zh=pref.reason_zh,
                 scope=pref.scope,
                 status=status,
-                device_id=device_id or None,
+                device_id=preference_device_id,
             )
             changed = changed or pref_id is not None
             if pref_id is not None:
                 upserted += 1
                 model_stored += 1
         if changed:
+            self.redis.delete_user_cards(user_id)
             self.events.enqueue_job(user_id, "user_card_rebuild", device_id=device_id or None)
         job_result = {
             "skipped": False,
@@ -1779,6 +1853,9 @@ class MemoryManager:
             "model_stored_preferences": model_stored,
             "stored_preferences": upserted,
             "changed": changed,
+            "extractor_raw_output": getattr(result, "raw_outputs", []),
+            "extractor_validated_output": getattr(result, "validated_outputs", []),
+            "fallback_used": bool(getattr(result, "fallback_used", False)),
         }
         return job_result
 
@@ -1797,14 +1874,19 @@ class MemoryManager:
         device_id = str(preference_context.get("device_id") or "") or None
         for pref in model_preferences:
             key, category = normalize_preference_key(pref.preference_key)
+            preference_device_id = None if key in {
+                "profile.occupation", "preference.likes", "preference.dislikes"
+            } else device_id
             if pref.action == "revoke":
-                self.events.revoke_preference(user_id, key, pref.value, device_id=device_id)
+                self.events.revoke_preference(user_id, key, pref.value, device_id=preference_device_id)
                 changed = True
                 upserted += 1
                 continue
             status = None
             if key == "other":
                 status = "candidate"
+            elif getattr(result, "schema_version", "") == "2.0":
+                status = "active"
             pref_id = self.events.upsert_preference(
                 user_id,
                 key,
@@ -1823,13 +1905,14 @@ class MemoryManager:
                 reason_zh=pref.reason_zh,
                 scope=pref.scope,
                 status=status,
-                device_id=device_id,
+                device_id=preference_device_id,
             )
             changed = changed or pref_id is not None
             if pref_id is not None:
                 upserted += 1
                 model_stored += 1
         if changed:
+            self.redis.delete_user_cards(user_id)
             self.events.enqueue_job(user_id, "user_card_rebuild", device_id=device_id)
         return {
             "existing_preference_count": len(existing),
@@ -1837,6 +1920,9 @@ class MemoryManager:
             "model_stored_preferences": model_stored,
             "stored_preferences": upserted,
             "changed": changed,
+            "extractor_raw_output": getattr(result, "raw_outputs", []),
+            "extractor_validated_output": getattr(result, "validated_outputs", []),
+            "fallback_used": bool(getattr(result, "fallback_used", False)),
         }
 
     def _build_preference_context(
@@ -1917,6 +2003,14 @@ class MemoryManager:
             "recent_turns": turns,
             "action_events": context_action_events,
             "range_user_event_count": len(message_events),
+            "source_user_events": [
+                {
+                    "event_id": event["id"],
+                    "text": event.get("content") or "",
+                    "created_at": event.get("created_at"),
+                }
+                for event in message_events
+            ],
         }
 
     @staticmethod
@@ -1972,6 +2066,7 @@ class MemoryManager:
             "user_id": user_id,
             "device_id": device_id,
             "version": max([int(item.get("revision", 1) or 1) for item in selected] or [1]),
+            "long_term_scope_version": 2,
             "profile_text_zh": profile,
             "preferences": [
                 {

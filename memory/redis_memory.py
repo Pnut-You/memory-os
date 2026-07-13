@@ -106,7 +106,7 @@ class ShortTermMemory:
         messages: list[dict[str, Any]],
         *,
         ttl_seconds: int | None = None,
-        max_items: int = 20,
+        max_items: int | None = 20,
     ) -> None:
         key = self.session_conversation_key(user_id, device_id, session_id)
         ttl = ttl_seconds or self.ttl_seconds
@@ -115,7 +115,8 @@ class ShortTermMemory:
                 pipe = self._redis.pipeline()
                 for message in messages:
                     pipe.rpush(key, json.dumps(message, ensure_ascii=False))
-                pipe.ltrim(key, -max(1, max_items), -1)
+                if max_items is not None:
+                    pipe.ltrim(key, -max(1, max_items), -1)
                 pipe.expire(key, ttl)
                 pipe.execute()
                 return
@@ -126,7 +127,8 @@ class ShortTermMemory:
         with self._lock:
             self._purge_expired(key)
             self._memory[key].extend(dict(message) for message in messages)
-            self._memory[key] = self._memory[key][-max(1, max_items) :]
+            if max_items is not None:
+                self._memory[key] = self._memory[key][-max(1, max_items) :]
             self._expires[key] = time.time() + ttl
 
     def get_conversation(self, device_id: str, user_id: str, limit: int | None = None) -> list[dict[str, Any]]:
@@ -269,6 +271,23 @@ class ShortTermMemory:
         with self._lock:
             self._memory.pop(key, None)
             self._expires.pop(key, None)
+
+    def delete_user_cards(self, user_id: str) -> None:
+        pattern = f"{self.prefix}:user-card:{user_id}*"
+        if self._redis is not None:
+            try:
+                keys = list(self._redis.scan_iter(match=pattern, count=100))
+                if keys:
+                    self._redis.delete(*keys)
+            except Exception as exc:
+                if not self.allow_memory_fallback:
+                    raise ConnectionError("Redis user card cleanup failed") from exc
+                self._redis = None
+        with self._lock:
+            prefix = f"{self.prefix}:user-card:{user_id}"
+            for key in [item for item in self._memory if item == prefix or item.startswith(prefix + ":")]:
+                self._memory.pop(key, None)
+                self._expires.pop(key, None)
 
     def _purge_expired(self, key: str) -> None:
         if self._expires.get(key, float("inf")) <= time.time():
