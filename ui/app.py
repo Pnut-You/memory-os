@@ -118,6 +118,15 @@ class QueryRequest(BaseModel):
     debug: bool = False
 
 
+class AgentConversationTurnRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    user_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    device_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    user_text: str = Field(min_length=1, max_length=10_000)
+    assistant_text: str = Field(min_length=1, max_length=10_000)
+    prompt_token_count: int | None = Field(default=None, ge=0)
+
+
 class DeviceStateRequest(BaseModel):
     state: dict[str, Any]
     observed_at: str | None = None
@@ -234,6 +243,34 @@ def submit_query(payload: QueryRequest, request: Request) -> dict:
         return _router_or_503(request).submit(payload.user_id, payload.device_id, query, payload.debug)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/agent/memory-context")
+def agent_memory_context(
+    request: Request,
+    user_id: str = Query(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    device_id: str = Query(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+) -> dict:
+    return _router_or_503(request).agent_memory_context(user_id, device_id)
+
+
+@app.post("/api/agent/conversation-turns")
+def add_agent_conversation_turn(payload: AgentConversationTurnRequest, request: Request) -> dict:
+    user_text = payload.user_text.strip()
+    assistant_text = payload.assistant_text.strip()
+    if not user_text or not assistant_text:
+        raise HTTPException(status_code=422, detail="user_text and assistant_text must not be blank")
+    try:
+        return _router_or_503(request).add_agent_conversation_turn(
+            payload.request_id,
+            payload.user_id,
+            payload.device_id,
+            user_text,
+            assistant_text,
+            payload.prompt_token_count,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/debug/users/{user_id}")

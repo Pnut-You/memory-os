@@ -17,7 +17,6 @@ from .preferences import (
     PREFERENCE_REGISTRY,
     PreferenceExtractor,
     normalize_preference_key,
-    should_schedule_preference,
 )
 from .redis_memory import ShortTermMemory
 from .sqlite_event import LEGACY_USER_ID, SQLiteEventStore
@@ -154,19 +153,22 @@ class MemoryManager:
         if session_id:
             existing = self.events.get_session(session_id)
             if existing and existing.get("user_id") == user_id and existing.get("device_id") == device_id:
-                session = {**existing, "last_activity_at": now, "expires_at": expires_at, "status": "active"}
-                self.events.upsert_session(
-                    session_id,
-                    user_id,
-                    device_id,
-                    str(session.get("local_date") or local_date),
-                    str(session.get("started_at") or now),
-                    now,
-                    expires_at,
-                    "active",
-                )
-                self.redis.set_active_session(user_id, device_id, session, self.session_ttl_seconds)
-                return session
+                gap_seconds = self._seconds_between(str(existing.get("last_activity_at") or ""), now)
+                if 0 <= gap_seconds <= self.session_idle_seconds:
+                    session = {**existing, "last_activity_at": now, "expires_at": expires_at, "status": "active"}
+                    self.events.upsert_session(
+                        session_id,
+                        user_id,
+                        device_id,
+                        str(session.get("local_date") or local_date),
+                        str(session.get("started_at") or now),
+                        now,
+                        expires_at,
+                        "active",
+                    )
+                    self.redis.set_active_session(user_id, device_id, session, self.session_ttl_seconds)
+                    return session
+                self._close_session_and_schedule_preference(existing)
         candidate = self.redis.get_active_session(user_id, device_id)
         if not candidate:
             candidate = self.events.latest_session(user_id, device_id, local_date)
@@ -188,6 +190,7 @@ class MemoryManager:
                 )
                 self.redis.set_active_session(user_id, device_id, session, self.session_ttl_seconds)
                 return session
+            self._close_session_and_schedule_preference(candidate)
         new_session = {
             "session_id": f"sess-{uuid.uuid4().hex}",
             "user_id": user_id,
@@ -201,6 +204,41 @@ class MemoryManager:
         self.events.upsert_session(**new_session)
         self.redis.set_active_session(user_id, device_id, new_session, self.session_ttl_seconds)
         return new_session
+
+    def _close_session_and_schedule_preference(self, session: dict[str, Any]) -> None:
+        session_id = str(session["session_id"])
+        user_id = str(session["user_id"])
+        device_id = str(session["device_id"])
+        self.events.upsert_session(
+            session_id,
+            user_id,
+            device_id,
+            str(session["local_date"]),
+            str(session["started_at"]),
+            str(session["last_activity_at"]),
+            str(session["expires_at"]),
+            "closed",
+        )
+        if user_id in {"anonymous", LEGACY_USER_ID}:
+            return
+        messages = self.events.list_events(
+            user_id=user_id,
+            device_id=device_id,
+            session_id=session_id,
+            role="user",
+            limit=10000,
+            ascending=True,
+        )
+        if not messages:
+            return
+        self.events.enqueue_job(
+            user_id,
+            "preference_extraction",
+            device_id=device_id,
+            session_id=session_id,
+            from_event_id=max(0, int(messages[0]["id"]) - 1),
+            to_event_id=int(messages[-1]["id"]),
+        )
 
     def start_memory_worker(self, poll_seconds: float = 2.0) -> None:
         if self._job_thread and self._job_thread.is_alive():
@@ -284,7 +322,6 @@ class MemoryManager:
         model_event_routes: list[dict[str, Any]] | None = None,
         session_id: str | None = None,
         prompt_token_count: int | None = None,
-        schedule_preference_extraction: bool = True,
     ) -> dict[str, Any]:
         timestamp = timestamp or iso_now()
         session = self.resolve_session(user_id, device_id, timestamp=timestamp, session_id=session_id)
@@ -332,13 +369,6 @@ class MemoryManager:
             memory_date,
             prompt_token_count=prompt_token_count,
         )
-        if user_id != "anonymous" and schedule_preference_extraction:
-            self._maybe_schedule_preference(
-                user_id,
-                device_id,
-                user_text,
-                int(routed.get("action_event_id") or user_event_id),
-            )
         return {
             "user_event_id": user_event_id,
             "assistant_event_id": assistant_event_id,
@@ -346,6 +376,52 @@ class MemoryManager:
             "session": session,
             "daily_extraction": daily_jobs,
             **routed,
+        }
+
+    def add_agent_conversation_turn(
+        self,
+        request_id: str,
+        user_id: str,
+        device_id: str,
+        user_text: str,
+        assistant_text: str,
+        prompt_token_count: int | None = None,
+    ) -> dict[str, Any]:
+        existing = self.events.get_message_pair(request_id)
+        if existing:
+            if (
+                len(existing) != 2
+                or str(existing[0].get("user_id")) != user_id
+                or str(existing[0].get("device_id")) != device_id
+                or str(existing[0].get("content")) != user_text
+                or str(existing[1].get("content")) != assistant_text
+            ):
+                raise ValueError("request_id already exists with different conversation content")
+            return {
+                "request_id": request_id,
+                "user_id": user_id,
+                "device_id": device_id,
+                "user_event_id": int(existing[0]["id"]),
+                "assistant_event_id": int(existing[1]["id"]),
+                "session_id": existing[0].get("session_id"),
+                "idempotent_replay": True,
+            }
+        result = self.add_conversation_turn(
+            request_id,
+            user_id,
+            device_id,
+            user_text,
+            assistant_text,
+            prompt_token_count=prompt_token_count,
+        )
+        return {
+            "request_id": request_id,
+            "user_id": user_id,
+            "device_id": device_id,
+            "user_event_id": result["user_event_id"],
+            "assistant_event_id": result["assistant_event_id"],
+            "session_id": result["session_id"],
+            "idempotent_replay": False,
         }
 
     def _route_model_event_candidates(
@@ -487,7 +563,7 @@ class MemoryManager:
         ][:limit]
         return {"user_card": card, "events": events, "preferences": active}
 
-    def get_long_term_facts(self, user_id: str, field: str) -> dict[str, Any]:
+    def get_long_term_facts(self, user_id: str, device_id: str, field: str) -> dict[str, Any]:
         key_by_field = {
             "occupation": "profile.occupation",
             "likes": "preference.likes",
@@ -496,7 +572,7 @@ class MemoryManager:
         key = key_by_field.get(field)
         if key is None:
             raise ValueError("field must be occupation, likes, or dislikes")
-        rows = self.events.list_long_term_facts(user_id, key, limit=100)
+        rows = self.events.list_long_term_facts(user_id, key, device_id=device_id, limit=100)
         values: list[str] = []
         for row in rows:
             value_json = row.get("value_json") or {}
@@ -512,10 +588,10 @@ class MemoryManager:
                 values.append(value)
         if field == "occupation":
             values = values[:1]
-        return {"user_id": user_id, "field": field, "preference_key": key, "values": values}
+        return {"user_id": user_id, "device_id": device_id, "field": field, "preference_key": key, "values": values}
 
-    def answer_long_term_fact(self, user_id: str, field: str) -> tuple[str, dict[str, Any]]:
-        facts = self.get_long_term_facts(user_id, field)
+    def answer_long_term_fact(self, user_id: str, device_id: str, field: str) -> tuple[str, dict[str, Any]]:
+        facts = self.get_long_term_facts(user_id, device_id, field)
         values = facts["values"]
         return ("、".join(values) if values else "未记录"), facts
 
@@ -537,11 +613,69 @@ class MemoryManager:
         return None
 
     def get_user_card(self, user_id: str, device_id: str | None = None) -> dict[str, Any] | None:
-        return self.redis.get_json(self.redis.user_card_key(user_id, device_id))
+        return self.redis.get_json(self.redis.user_card_key(user_id, device_id)) or self.restore_user_card(user_id, device_id)
+
+    def write_long_term_preference(
+        self,
+        user_id: str,
+        preference_key: str,
+        value: str,
+        *,
+        event_id: int | None = None,
+        session_id: str | None = None,
+        confidence: float = 1.0,
+        source_type: str = "explicit",
+        device_id: str | None = None,
+    ) -> int | None:
+        if preference_key not in {"profile.occupation", "preference.likes", "preference.dislikes"}:
+            raise ValueError("unsupported long-term preference key")
+        text = str(value).strip()
+        if not text:
+            raise ValueError("long-term preference value is required")
+        evidence = []
+        if event_id is not None:
+            event = self.events.get_event(event_id)
+            if not event or str(event.get("user_id")) != user_id or str(event.get("role")) != "user":
+                raise ValueError("event_id must reference a user message owned by user_id")
+            if session_id and str(event.get("session_id") or "") != session_id:
+                raise ValueError("event_id does not belong to session_id")
+            if device_id is None:
+                device_id = str(event.get("device_id") or "") or None
+            evidence = [{"event_id": event_id, "text": str(event.get("content") or ""), "type": source_type}]
+        pref_id = self.events.upsert_preference(
+            user_id,
+            preference_key,
+            "profile" if preference_key == "profile.occupation" else "preference",
+            {"type": "string", "value": text, "code": text, "label_zh": text},
+            text,
+            evidence,
+            polarity="avoid" if preference_key == "preference.dislikes" else "prefer",
+            confidence=confidence,
+            strength=confidence,
+            source_type=source_type,
+            scope="user",
+            status="active",
+            device_id=device_id,
+        )
+        self.redis.delete_user_cards(user_id)
+        self.events.enqueue_job(user_id, "user_card_rebuild", device_id=device_id)
+        return pref_id
+
+    def revoke_long_term_preference(
+        self, user_id: str, preference_key: str, value: str | None = None, device_id: str | None = None
+    ) -> None:
+        if preference_key not in {"profile.occupation", "preference.likes", "preference.dislikes"}:
+            raise ValueError("unsupported long-term preference key")
+        normalized = None if value is None else {
+            "type": "string", "value": value, "code": value, "label_zh": value
+        }
+        self.events.revoke_preference(user_id, preference_key, normalized, device_id=device_id)
+        self.redis.delete_user_cards(user_id)
+        self.events.enqueue_job(user_id, "user_card_rebuild", device_id=device_id)
 
     def restore_user_card(self, user_id: str, device_id: str | None = None) -> dict[str, Any] | None:
         preferences = self.events.list_preferences(user_id, status="active", limit=100, device_id=device_id)
-        user_facts = self.events.list_long_term_facts(user_id, limit=100)
+        user_facts = self.events.list_long_term_facts(user_id, device_id=device_id, limit=100)
         target_keys = {"profile.occupation", "preference.likes", "preference.dislikes"}
         preferences = user_facts + [
             item for item in preferences if item.get("preference_key") not in target_keys
@@ -1114,29 +1248,6 @@ class MemoryManager:
             "to_event_id": to_event_id,
             "queued": queued,
         }
-
-    def _maybe_schedule_preference(
-        self,
-        user_id: str,
-        device_id: str,
-        user_text: str,
-        user_event_id: int,
-    ) -> None:
-        if user_id in {"anonymous", LEGACY_USER_ID}:
-            return
-        latest_job_to = self.events.latest_preference_extraction_event_id(user_id, device_id)
-        # Duplicate pending jobs are collapsed by a unique partial index.
-        should = should_schedule_preference(user_text)
-        if not should:
-            should = self.events.count_user_messages_since(user_id, latest_job_to, device_id) >= self.preference_extract_min_new_user_messages
-        if should:
-            self.events.enqueue_job(
-                user_id,
-                "preference_extraction",
-                device_id=device_id,
-                from_event_id=latest_job_to,
-                to_event_id=user_event_id,
-            )
 
     def _schedule_summary(
         self,
@@ -1753,18 +1864,22 @@ class MemoryManager:
         from_id = int(job.get("from_event_id") or 0)
         to_id = int(job.get("to_event_id") or self.events.latest_user_event_id(user_id) or 0)
         device_id = str(job.get("device_id") or "")
+        session_id = str(job.get("session_id") or "")
         message_events = [
             event
-            for event in self.events.list_events(user_id=user_id, device_id=device_id or None, role="user", limit=200, ascending=True)
+            for event in self.events.list_events(
+                user_id=user_id,
+                device_id=device_id or None,
+                session_id=session_id or None,
+                role="user",
+                limit=10000,
+                ascending=True,
+            )
             if from_id < int(event["id"]) <= to_id
         ]
         if not device_id and message_events:
             device_id = str(message_events[-1]["device_id"])
-        action_events = [
-            event
-            for event in self.events.list_action_events(user_id=user_id, device_id=device_id or job.get("device_id"), limit=50)
-            if from_id < int(event["id"]) <= to_id
-        ]
+        action_events: list[dict[str, Any]] = []
         preference_context = self._build_preference_context(
             user_id,
             device_id or None,
@@ -1772,12 +1887,13 @@ class MemoryManager:
             to_id,
             message_events,
             action_events,
-            session_id=str(message_events[-1].get("session_id") or "") if message_events else None,
+            session_id=session_id or (str(message_events[-1].get("session_id") or "") if message_events else None),
         )
-        if not preference_context["recent_turns"] and not preference_context["action_events"] and not preference_context.get("rolling_summary"):
+        preference_context["context_mode"] = "closed_session_user_messages"
+        if not message_events:
             return {"skipped": True, "reason": "no events in extraction range", "from_event_id": from_id, "to_event_id": to_id}
-        input_user_events = sum(len(turn["messages"]) for turn in preference_context["recent_turns"])
-        input_action_events = len(preference_context["action_events"])
+        input_user_events = len(message_events)
+        input_action_events = 0
         existing = self.events.list_preferences(user_id, status=None, limit=100, device_id=device_id or None)
         preference_context["existing_preference_count"] = len(existing)
         changed = False
@@ -1789,9 +1905,7 @@ class MemoryManager:
         model_stored = 0
         for pref in model_preferences:
             key, category = normalize_preference_key(pref.preference_key)
-            preference_device_id = None if key in {
-                "profile.occupation", "preference.likes", "preference.dislikes"
-            } else (device_id or None)
+            preference_device_id = device_id or None
             seen_preference_keys.add(
                 (
                     key,
@@ -1839,7 +1953,8 @@ class MemoryManager:
             "skipped": False,
             "from_event_id": from_id,
             "to_event_id": to_id,
-            "context_mode": "summary_plus_recent_turns",
+            "context_mode": "closed_session_user_messages",
+            "session_id": session_id or None,
             "summary_version": preference_context.get("summary_version", 0),
             "recent_turn_count": len(preference_context["recent_turns"]),
             "action_event_count": len(preference_context["action_events"]),
@@ -1856,6 +1971,7 @@ class MemoryManager:
             "extractor_raw_output": getattr(result, "raw_outputs", []),
             "extractor_validated_output": getattr(result, "validated_outputs", []),
             "fallback_used": bool(getattr(result, "fallback_used", False)),
+            "extractor_request_metrics": getattr(result, "request_metrics", []),
         }
         return job_result
 
@@ -1874,9 +1990,7 @@ class MemoryManager:
         device_id = str(preference_context.get("device_id") or "") or None
         for pref in model_preferences:
             key, category = normalize_preference_key(pref.preference_key)
-            preference_device_id = None if key in {
-                "profile.occupation", "preference.likes", "preference.dislikes"
-            } else device_id
+            preference_device_id = device_id
             if pref.action == "revoke":
                 self.events.revoke_preference(user_id, key, pref.value, device_id=preference_device_id)
                 changed = True

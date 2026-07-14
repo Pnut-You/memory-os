@@ -13,7 +13,7 @@ from memory import MemoryConfig, MemoryManager, ShortTermMemory
 from memory.migrate import migrate_jsonl
 from memory.preferences import ActionPreferenceExtractionResult, PreferenceExtractionResult, PreferenceExtractor
 from memory.sqlite_event import LEGACY_USER_ID, SQLiteEventStore
-from ui.app import QueryRequest
+from ui.app import AgentConversationTurnRequest, QueryRequest
 from ui.llm import DebugChatLLM
 from ui.router import MemoryDebugRouter
 from evaluation.run_preference_eval import answer_contains_expected
@@ -207,6 +207,86 @@ class MemorySystemTests(unittest.TestCase):
         with self.assertRaises(Exception):
             QueryRequest(user_id="bad id", device_id="dog-1", query="你好")
 
+    def test_agent_turn_contract_and_idempotent_write(self):
+        payload = AgentConversationTurnRequest(
+            request_id="agent-r1",
+            user_id="user-001",
+            device_id="dog-001",
+            user_text="我喜欢飞盘",
+            assistant_text="我记住了",
+        )
+        manager = self.make_manager()
+        try:
+            values = {
+                "request_id": payload.request_id,
+                "user_id": payload.user_id,
+                "device_id": payload.device_id,
+                "user_text": payload.user_text,
+                "assistant_text": payload.assistant_text,
+                "prompt_token_count": payload.prompt_token_count,
+            }
+            first = manager.add_agent_conversation_turn(**values)
+            replay = manager.add_agent_conversation_turn(**values)
+            self.assertFalse(first["idempotent_replay"])
+            self.assertTrue(replay["idempotent_replay"])
+            self.assertEqual(first["user_event_id"], replay["user_event_id"])
+            self.assertEqual(len(manager.events.get_message_pair("agent-r1")), 2)
+            with self.assertRaises(ValueError):
+                manager.add_agent_conversation_turn(
+                    "agent-r1", "user-001", "dog-001", "不同内容", "我记住了"
+                )
+        finally:
+            manager.close()
+
+    def test_agent_memory_context_returns_only_matching_dog_preferences(self):
+        manager = self.make_manager()
+        router = MemoryDebugRouter(manager, FakeLLM())
+        try:
+            manager.add_agent_conversation_turn(
+                "agent-r1", "user-001", "dog-001", "当前狗的短期消息", "收到"
+            )
+            for dog, value in (("dog-001", "飞盘"), ("dog-002", "苹果")):
+                manager.events.upsert_preference(
+                    "user-001",
+                    "preference.likes",
+                    "preference",
+                    {"type": "string", "value": value},
+                    value,
+                    [],
+                    confidence=0.95,
+                    device_id=dog,
+                )
+            context = router.agent_memory_context("user-001", "dog-001")
+            self.assertEqual([item["content"] for item in context["recent_messages"]], [
+                "当前狗的短期消息", "收到"
+            ])
+            self.assertEqual(
+                {item["display_text_zh"] for item in context["active_preferences"]},
+                {"飞盘"},
+            )
+        finally:
+            manager.close()
+
+    def test_legacy_preferences_migrate_to_selected_dog_idempotently(self):
+        manager = self.make_manager()
+        try:
+            manager.events.upsert_preference(
+                "user-001",
+                "preference.likes",
+                "preference",
+                {"type": "string", "value": "飞盘"},
+                "飞盘",
+                [],
+                confidence=0.95,
+            )
+            self.assertEqual(manager.events.migrate_legacy_preferences("user-001", "dog-001"), 1)
+            self.assertEqual(manager.events.migrate_legacy_preferences("user-001", "dog-001"), 0)
+            self.assertEqual(len(manager.events.list_long_term_facts(
+                "user-001", "preference.likes", device_id="dog-001"
+            )), 1)
+        finally:
+            manager.close()
+
     def test_same_user_card_is_scoped_by_device(self):
         manager = self.make_manager()
         try:
@@ -266,6 +346,31 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_session_timeout_closes_old_session_and_queues_it_once(self):
+        manager = self.make_manager()
+        try:
+            first = manager.add_conversation_turn(
+                "r1", "u1", "dog-1", "没有关键词也要检查", "好",
+                timestamp="2026-07-02T09:00:00+08:00",
+            )
+            second = manager.add_conversation_turn(
+                "r2", "u1", "dog-1", "新会话", "好",
+                timestamp="2026-07-02T09:00:16+08:00",
+                session_id=first["session_id"],
+            )
+            self.assertNotEqual(first["session_id"], second["session_id"])
+            self.assertEqual(manager.events.get_session(first["session_id"])["status"], "closed")
+            jobs = manager.events.list_jobs(job_type="preference_extraction")
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["session_id"], first["session_id"])
+            manager.resolve_session(
+                "u1", "dog-1", session_id=first["session_id"],
+                timestamp="2026-07-02T09:00:17+08:00",
+            )
+            self.assertEqual(len(manager.events.list_jobs(job_type="preference_extraction")), 1)
+        finally:
+            manager.close()
+
     def test_short_term_memory_does_not_cross_devices(self):
         manager = self.make_manager()
         try:
@@ -279,7 +384,7 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_primary_long_term_preferences_follow_user_across_devices(self):
+    def test_primary_long_term_preferences_are_scoped_by_device(self):
         manager = self.make_manager()
         try:
             manager.events.upsert_preference(
@@ -293,11 +398,36 @@ class MemorySystemTests(unittest.TestCase):
                 device_id="dog-001",
             )
             manager.rebuild_user_card("user-001", "dog-001")
-            self.assertEqual(len(manager.events.list_long_term_facts("user-001", "preference.likes")), 1)
+            self.assertEqual(len(manager.events.list_long_term_facts(
+                "user-001", "preference.likes", device_id="dog-001"
+            )), 1)
             self.assertEqual(manager.events.list_preferences("user-001", status="active", device_id="dog-002"), [])
             manager.rebuild_user_card("user-001", "dog-002")
             self.assertIsNotNone(manager.get_user_card("user-001", "dog-001"))
-            self.assertIsNotNone(manager.get_user_card("user-001", "dog-002"))
+            self.assertIsNone(manager.get_user_card("user-001", "dog-002"))
+        finally:
+            manager.close()
+
+    def test_internal_long_term_write_revoke_and_card_restore(self):
+        manager = self.make_manager()
+        try:
+            turn = manager.add_conversation_turn("r1", "user-001", "dog-001", "我喜欢飞盘", "好")
+            pref_id = manager.write_long_term_preference(
+                "user-001",
+                "preference.likes",
+                "飞盘",
+                event_id=turn["user_event_id"],
+                session_id=turn["session_id"],
+            )
+            self.assertIsNotNone(pref_id)
+            card = manager.get_user_card("user-001", "dog-001")
+            self.assertIn("preference.likes", {item["key"] for item in card["preferences"]})
+            manager.revoke_long_term_preference(
+                "user-001", "preference.likes", "飞盘", device_id="dog-001"
+            )
+            self.assertEqual(manager.events.list_long_term_facts(
+                "user-001", "preference.likes", device_id="dog-001"
+            ), [])
         finally:
             manager.close()
 
@@ -333,11 +463,11 @@ class MemorySystemTests(unittest.TestCase):
 
             self.assertEqual(
                 {item["display_text_zh"] for item in dog1["active_preferences"]},
-                {"喜欢飞盘", "喜欢苹果"},
+                {"喜欢飞盘"},
             )
             self.assertEqual(
                 {item["display_text_zh"] for item in dog2["active_preferences"]},
-                {"喜欢飞盘", "喜欢苹果"},
+                {"喜欢苹果"},
             )
             self.assertEqual(dog1["user_card"]["device_id"], "dog-001")
             self.assertEqual(dog2["user_card"]["device_id"], "dog-002")
@@ -352,23 +482,23 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_ten_user_messages_create_preference_job(self):
+    def test_message_count_does_not_create_preference_job_before_session_ends(self):
         manager = self.make_manager()
         try:
             for i in range(9):
                 manager.add_conversation_turn(f"r{i}", "user-001", "dog-001", f"普通消息{i}", "好")
             self.assertEqual(manager.events.job_counts().get("pending", 0), 0)
             manager.add_conversation_turn("r9", "user-001", "dog-001", "普通消息9", "好")
-            self.assertEqual(manager.events.job_counts().get("pending"), 1)
+            self.assertEqual(manager.events.job_counts().get("pending", 0), 0)
         finally:
             manager.close()
 
-    def test_explicit_like_occupation_and_dislike_schedule_preference_jobs(self):
+    def test_preference_keywords_do_not_schedule_before_session_ends(self):
         for text in ("我喜欢摄影", "我是摄影师", "我不喜欢吵闹"):
             manager = self.make_manager()
             try:
                 manager.add_conversation_turn(f"r-{text}", "user-001", "dog-001", text, "好")
-                self.assertEqual(manager.events.job_counts().get("pending"), 1, text)
+                self.assertEqual(manager.events.job_counts().get("pending", 0), 0, text)
             finally:
                 manager.close()
 
@@ -396,7 +526,7 @@ class MemorySystemTests(unittest.TestCase):
             result = router.submit("user-001", "dog-1", "记住我喜欢安静", debug=True)
             self.assertEqual(result["assistant_reply"], "好的，我会优先选择安静的路线。")
             self.assertEqual(extractor.calls, [])
-            self.assertEqual(manager.events.job_counts().get("pending"), 1)
+            self.assertEqual(manager.events.job_counts().get("pending", 0), 0)
         finally:
             manager.close()
 
@@ -434,7 +564,13 @@ class MemorySystemTests(unittest.TestCase):
             }
         )
         try:
-            manager.add_conversation_turn("r1", "user-001", "dog-1", "记住我喜欢安静路线", "好")
+            manager.add_conversation_turn(
+                "r1", "user-001", "dog-1", "记住我喜欢安静路线", "好",
+                timestamp="2026-07-02T09:00:00+08:00",
+            )
+            manager.get_conversation_context(
+                "user-001", "dog-1", timestamp="2026-07-02T09:00:16+08:00"
+            )
             self.assertEqual(manager.process_memory_jobs_once()["succeeded"], 1)
             self.assertEqual(manager.process_memory_jobs_once()["succeeded"], 1)
             prefs = manager.events.list_preferences("user-001", status="active", device_id="dog-1")
@@ -565,11 +701,17 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_auto_preference_extraction_still_skips_without_new_messages(self):
+    def test_closed_session_is_not_reprocessed_without_new_messages(self):
         manager = self.make_manager()
         manager.preference_extractor = FakeExtractor()
         try:
-            manager.add_conversation_turn("r1", "user-001", "dog-001", "记住我喜欢安静", "好")
+            manager.add_conversation_turn(
+                "r1", "user-001", "dog-001", "记住我喜欢安静", "好",
+                timestamp="2026-07-02T09:00:00+08:00",
+            )
+            manager.get_conversation_context(
+                "user-001", "dog-001", timestamp="2026-07-02T09:00:16+08:00"
+            )
             self.assertEqual(manager.process_memory_jobs_once()["succeeded"], 1)
             result = manager.trigger_preference_extraction("user-001", "dog-001", force_recent=False)
             self.assertEqual(result["message"], "没有可抽取的新用户消息")
@@ -577,7 +719,7 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
-    def test_preference_extraction_uses_summary_plus_recent_turns(self):
+    def test_manual_preference_extraction_keeps_debug_context(self):
         manager = self.make_manager()
         manager.summarizer = CaptureSummarizer()
         manager.preference_extractor = FakeExtractor()
@@ -596,7 +738,7 @@ class MemorySystemTests(unittest.TestCase):
             result = manager.trigger_preference_extraction("user-001", "dog-001", force_recent=True)
             self.assertEqual(result["process"]["succeeded"], 1)
             context = manager.preference_extractor.calls[-1]["events"]
-            self.assertEqual(context["context_mode"], "summary_plus_recent_turns")
+            self.assertEqual(context["context_mode"], "closed_session_user_messages")
             self.assertIn("summary:", context["rolling_summary"])
             texts = [
                 message["text"]
@@ -633,6 +775,9 @@ class MemorySystemTests(unittest.TestCase):
             for i in range(1, 10):
                 manager.add_conversation_turn(f"r{i}", "user-001", "dog-001", f"普通消息{i}", "好")
             self.assertTrue(manager.wait_for_summaries())
+            manager.get_conversation_context(
+                "user-001", "dog-001", timestamp="2099-01-01T00:00:00+08:00"
+            )
             result = manager.process_memory_jobs_once()
             self.assertGreaterEqual(result["succeeded"], 1)
             prefs = manager.events.list_preferences("user-001", status="active")
@@ -646,7 +791,13 @@ class MemorySystemTests(unittest.TestCase):
         manager = self.make_manager()
         manager.preference_extractor = FakeExtractor()
         try:
-            manager.add_conversation_turn("r1", "user-001", "dog-001", "记住我喜欢安静", "好")
+            manager.add_conversation_turn(
+                "r1", "user-001", "dog-001", "记住我喜欢安静", "好",
+                timestamp="2026-07-02T09:00:00+08:00",
+            )
+            manager.get_conversation_context(
+                "user-001", "dog-001", timestamp="2026-07-02T09:00:16+08:00"
+            )
             claimed = manager.events.claim_jobs(1, max_attempts=3)
             self.assertEqual(claimed[0]["job_type"], "preference_extraction")
             with manager.events._lock:
@@ -665,7 +816,13 @@ class MemorySystemTests(unittest.TestCase):
         manager = self.make_manager()
         manager.preference_extractor = FailingExtractor()
         try:
-            manager.add_conversation_turn("r1", "user-001", "dog-001", "记住这件事", "好")
+            manager.add_conversation_turn(
+                "r1", "user-001", "dog-001", "记住这件事", "好",
+                timestamp="2026-07-02T09:00:00+08:00",
+            )
+            manager.get_conversation_context(
+                "user-001", "dog-001", timestamp="2026-07-02T09:00:16+08:00"
+            )
             for _ in range(manager.preference_extract_max_attempts):
                 result = manager.process_memory_jobs_once()
                 self.assertEqual(result["failed"], 1)
@@ -678,7 +835,13 @@ class MemorySystemTests(unittest.TestCase):
         manager = self.make_manager()
         manager.preference_extractor = FailingExtractor()
         try:
-            manager.add_conversation_turn("r1", "user-001", "dog-001", "我喜欢吃苹果", "好")
+            manager.add_conversation_turn(
+                "r1", "user-001", "dog-001", "我喜欢吃苹果", "好",
+                timestamp="2026-07-02T09:00:00+08:00",
+            )
+            manager.get_conversation_context(
+                "user-001", "dog-001", timestamp="2026-07-02T09:00:16+08:00"
+            )
             result = manager.process_memory_jobs_once()
             self.assertEqual(result["succeeded"], 0)
             self.assertEqual(result["failed"], 1)
@@ -820,13 +983,19 @@ class MemorySystemTests(unittest.TestCase):
         self.assertTrue(answer_contains_expected("根据我的记忆，您不喜欢刺耳的提示音。", "刺耳提示音"))
         self.assertFalse(answer_contains_expected("你的职业是医生。", "程序员"))
 
-    def test_strict_preference_output_rejects_value_not_in_current_text(self):
-        raw = json.dumps(
-            {"type": "occupation", "value": "程序员", "evidence": "我的职业是程序员", "confidence": 0.99},
-            ensure_ascii=False,
-        )
-        with self.assertRaisesRegex(ValueError, "current user text"):
-            PreferenceExtractor._validate_strict_output(raw, "我的职业是医生")
+    def test_session_preference_output_rejects_cross_event_evidence(self):
+        raw = json.dumps({"preferences": [{
+            "event_id": 1,
+            "type": "occupation",
+            "value": "程序员",
+            "evidence": "我的职业是程序员",
+            "confidence": 0.99,
+        }]}, ensure_ascii=False)
+        with self.assertRaisesRegex(ValueError, "referenced user text"):
+            PreferenceExtractor._validate_session_output(
+                raw,
+                [{"event_id": 1, "text": "我的职业是医生"}, {"event_id": 2, "text": "我的职业是程序员"}],
+            )
 
     def test_hybrid_preference_extractor_falls_back_after_validation_failure(self):
         extractor = PreferenceExtractor(
@@ -838,15 +1007,18 @@ class MemorySystemTests(unittest.TestCase):
             small_model="small-model",
             large_model="large-model",
         )
-        invalid = json.dumps(
-            {"type": "likes", "value": "摄影", "evidence": "我喜欢摄影", "confidence": 0.9},
-            ensure_ascii=False,
-        )
-        valid = json.dumps(
-            {"type": "likes", "value": "羽毛球", "evidence": "我喜欢羽毛球", "confidence": 0.95},
-            ensure_ascii=False,
-        )
-        with patch.object(extractor, "_request_strict_extraction", side_effect=[invalid, valid]) as request:
+        invalid = json.dumps({"preferences": [{
+            "event_id": 1, "type": "likes", "value": "摄影",
+            "evidence": "我喜欢摄影", "confidence": 0.9,
+        }]}, ensure_ascii=False)
+        valid = json.dumps({"preferences": [{
+            "event_id": 1, "type": "likes", "value": "羽毛球",
+            "evidence": "我喜欢羽毛球", "confidence": 0.95,
+        }]}, ensure_ascii=False)
+        with patch.object(
+            extractor, "_request_session_extraction",
+            side_effect=[(invalid, {}), (valid, {})],
+        ) as request:
             result = extractor.extract(
                 "u",
                 {"source_user_events": [{"event_id": 1, "text": "我喜欢羽毛球"}]},
@@ -856,6 +1028,33 @@ class MemorySystemTests(unittest.TestCase):
         self.assertTrue(result.fallback_used)
         self.assertEqual(result.preferences[0].value["value"], "羽毛球")
 
+    def test_session_extractor_sends_all_user_messages_in_one_request(self):
+        extractor = PreferenceExtractor(
+            enabled=True,
+            api_key="test",
+            base_url="https://example.test/v1",
+            model="flash",
+        )
+        raw = json.dumps({"preferences": [{
+            "event_id": 2,
+            "type": "likes",
+            "value": "安静",
+            "evidence": "这种环境挺安静，我很享受",
+            "confidence": 0.92,
+        }]}, ensure_ascii=False)
+        with patch.object(
+            extractor, "_request_session_extraction", return_value=(raw, {"prompt_tokens": 42})
+        ) as request:
+            result = extractor.extract("u", {"source_user_events": [
+                {"event_id": 1, "text": "今天聊点别的"},
+                {"event_id": 2, "text": "这种环境挺安静，我很享受"},
+            ]})
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[1][0]["event_id"], 1)
+        self.assertEqual(len(request.call_args.args[1]), 2)
+        self.assertEqual(result.preferences[0].value["value"], "安静")
+        self.assertEqual(result.request_metrics[0]["usage"]["prompt_tokens"], 42)
+
     def test_valid_none_does_not_trigger_hybrid_fallback(self):
         extractor = PreferenceExtractor(
             enabled=True,
@@ -864,8 +1063,8 @@ class MemorySystemTests(unittest.TestCase):
             model="legacy-large",
             mode="hybrid",
         )
-        raw = json.dumps({"type": "none", "value": "", "evidence": "", "confidence": 0.0})
-        with patch.object(extractor, "_request_strict_extraction", return_value=raw) as request:
+        raw = json.dumps({"preferences": []})
+        with patch.object(extractor, "_request_session_extraction", return_value=(raw, {})) as request:
             result = extractor.extract(
                 "u",
                 {"source_user_events": [{"event_id": 1, "text": "我是来聊天的"}]},
@@ -890,7 +1089,7 @@ class MemorySystemTests(unittest.TestCase):
                     confidence=0.95,
                     device_id="dog-1",
                 )
-            result = router.submit("u", "dog-2", "根据长期记忆，你记得我喜欢什么？", debug=True)
+            result = router.submit("u", "dog-1", "根据长期记忆，你记得我喜欢什么？", debug=True)
             self.assertEqual(set(result["assistant_reply"].split("、")), {"羽毛球", "电子音乐"})
             self.assertEqual(llm.calls, [])
             self.assertEqual(result["model"], "sqlite-long-term-facts")
@@ -931,13 +1130,13 @@ class MemorySystemTests(unittest.TestCase):
                     confidence=0.95,
                     device_id="dog-1",
                 )
-            self.assertEqual(manager.answer_long_term_fact("current-user", "occupation")[0], "医生")
+            self.assertEqual(manager.answer_long_term_fact("current-user", "dog-1", "occupation")[0], "医生")
             self.assertEqual(
-                set(manager.answer_long_term_fact("current-user", "likes")[0].split("、")),
+                set(manager.answer_long_term_fact("current-user", "dog-1", "likes")[0].split("、")),
                 {"羽毛球", "电子音乐"},
             )
-            self.assertEqual(manager.answer_long_term_fact("current-user", "dislikes")[0], "香菜")
-            self.assertEqual(manager.answer_long_term_fact("missing-user", "likes")[0], "未记录")
+            self.assertEqual(manager.answer_long_term_fact("current-user", "dog-1", "dislikes")[0], "香菜")
+            self.assertEqual(manager.answer_long_term_fact("missing-user", "dog-1", "likes")[0], "未记录")
         finally:
             manager.close()
 
