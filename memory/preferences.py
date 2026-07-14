@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -36,29 +36,6 @@ PREFERENCE_REGISTRY: dict[str, str] = {
     "motion.turn_amplitude": "转弯幅度",
     "motion.follow_distance": "跟随距离",
 }
-
-PREFERENCE_KEYWORDS = (
-    "我是",
-    "我的职业",
-    "我从事",
-    "我做",
-    "我喜欢",
-    "喜欢",
-    "我爱",
-    "爱好",
-    "偏好",
-    "我不喜欢",
-    "不喜欢",
-    "我习惯",
-    "以后都",
-    "以后不要",
-    "默认给我",
-    "尽量",
-    "我更喜欢",
-    "我讨厌",
-    "记住",
-)
-
 
 class PreferenceExtractionError(RuntimeError):
     def __init__(self, message: str, attempts: list[dict[str, Any]]) -> None:
@@ -103,6 +80,7 @@ class PreferenceExtractionResult:
     raw_outputs: list[dict[str, Any]] = field(default_factory=list)
     validated_outputs: list[dict[str, Any]] = field(default_factory=list)
     fallback_used: bool = False
+    request_metrics: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def model_validate(cls, value: dict[str, Any], default_user_id: str = "") -> "PreferenceExtractionResult":
@@ -303,25 +281,18 @@ class PreferenceExtractor:
     ) -> PreferenceExtractionResult:
         if not self.configured:
             return PreferenceExtractionResult(schema_version="2.0", user_id=user_id, preferences=[])
-        preferences: list[ExtractedPreferenceModel] = []
-        raw_outputs: list[dict[str, Any]] = []
-        validated_outputs: list[dict[str, Any]] = []
-        fallback_used = False
+        source_events = []
         for event in self._source_user_events(events):
             event_id = int(event.get("event_id") or event.get("id") or 0)
             source_text = str(event.get("text") or event.get("content") or "").strip()
-            if not source_text or not self._may_contain_target_preference(source_text):
-                continue
-            try:
-                candidate, attempts, used_fallback = self._extract_one(source_text)
-            except PreferenceExtractionError as exc:
-                attempts = [{"event_id": event_id, **attempt} for attempt in exc.attempts]
-                raise PreferenceExtractionError(str(exc), attempts) from exc
-            raw_outputs.extend({"event_id": event_id, **attempt} for attempt in attempts)
-            fallback_used = fallback_used or used_fallback
-            validated_outputs.append({"event_id": event_id, **candidate})
-            if candidate["type"] == "none":
-                continue
+            if source_text and event_id:
+                source_events.append({"event_id": event_id, "text": source_text})
+        if not source_events:
+            return PreferenceExtractionResult(schema_version="2.0", user_id=user_id, preferences=[])
+        candidates, attempts, fallback_used, metrics = self._extract_session(source_events)
+        preferences: list[ExtractedPreferenceModel] = []
+        for candidate in candidates:
+            event_id = int(candidate["event_id"])
             key = {
                 "occupation": "profile.occupation",
                 "likes": "preference.likes",
@@ -352,89 +323,88 @@ class PreferenceExtractor:
             schema_version="2.0",
             user_id=user_id,
             preferences=preferences,
-            raw_outputs=raw_outputs,
-            validated_outputs=validated_outputs,
+            raw_outputs=attempts,
+            validated_outputs=candidates,
             fallback_used=fallback_used,
+            request_metrics=metrics,
         )
 
-    @staticmethod
-    def _source_user_events(context: dict[str, Any]) -> list[dict[str, Any]]:
-        source = context.get("source_user_events")
-        if isinstance(source, list):
-            return [item for item in source if isinstance(item, dict)]
-        result: list[dict[str, Any]] = []
-        for turn in context.get("recent_turns") or []:
-            for message in turn.get("messages") or []:
-                if isinstance(message, dict) and message.get("role") == "user":
-                    result.append(message)
-        return result
-
-    @staticmethod
-    def _may_contain_target_preference(text: str) -> bool:
-        return bool(
-            re.search(
-                r"职业|工作|身份|从事|一名|我是|我做|喜欢|喜爱|爱好|偏爱|偏好|合胃口|"
-                r"不喜欢|不爱|讨厌|受不了|不舒服|避开|不要有",
-                text,
-            )
-        )
-
-    def _extract_one(self, source_text: str) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    def _extract_session(
+        self, source_events: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool, list[dict[str, Any]]]:
         models = [self.large_model] if self.mode == "large" else [self.small_model]
         if self.mode == "hybrid":
             models.append(self.large_model)
         attempts: list[dict[str, Any]] = []
+        metrics: list[dict[str, Any]] = []
         last_error = "unknown validation error"
         for index, model in enumerate(models):
             raw = ""
+            started = time.perf_counter()
             try:
-                raw = self._request_strict_extraction(model, source_text)
-                candidate = self._validate_strict_output(raw, source_text)
+                raw, usage = self._request_session_extraction(model, source_events)
+                candidates = self._validate_session_output(raw, source_events)
+                elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
                 attempts.append({"model": model, "raw_output": raw, "validation_error": ""})
-                return candidate, attempts, index > 0
+                metrics.append({
+                    "model": model,
+                    "input_events": len(source_events),
+                    "input_chars": sum(len(item["text"]) for item in source_events),
+                    "output_chars": len(raw),
+                    "duration_ms": elapsed_ms,
+                    "usage": usage,
+                    "succeeded": True,
+                })
+                return candidates, attempts, index > 0, metrics
             except Exception as exc:
+                elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
                 last_error = f"{type(exc).__name__}: {exc}"
                 attempts.append({"model": model, "raw_output": raw, "validation_error": last_error})
-        raise PreferenceExtractionError(
-            f"preference extraction validation failed: {last_error}",
-            attempts,
-        )
+                metrics.append({
+                    "model": model,
+                    "input_events": len(source_events),
+                    "input_chars": sum(len(item["text"]) for item in source_events),
+                    "output_chars": len(raw),
+                    "duration_ms": elapsed_ms,
+                    "usage": {},
+                    "succeeded": False,
+                })
+        raise PreferenceExtractionError(f"preference extraction validation failed: {last_error}", attempts)
 
-    def _request_strict_extraction(self, model: str, source_text: str) -> str:
+    def _request_session_extraction(
+        self, model: str, source_events: list[dict[str, Any]]
+    ) -> tuple[str, dict[str, Any]]:
         payload = {
             "model": model,
             "enable_thinking": False,
             "temperature": 0,
-            "max_tokens": 160,
+            "max_tokens": 800,
             "response_format": {"type": "json_object"},
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        "你是长期偏好抽取器。只分析当前这一条用户原文。"
-                        "只输出一个严格 JSON 对象，不要 Markdown、解释或额外字段。"
-                        "type 只能是 occupation、likes、dislikes、none。"
-                        "occupation 表示用户明确陈述的职业或工作身份；"
-                        "likes 表示用户明确喜欢、偏好或正面接受的对象；"
-                        "dislikes 表示用户明确不喜欢、讨厌、避开或感到不舒服的对象。"
-                        "“不太喜欢”属于 dislikes，“偏好里加上”属于 likes，“偏好里不要有”属于 dislikes。"
-                        "原文明示以上事实时不得返回 none。"
-                        "value 必须逐字来自当前原文，evidence 必须是包含 value 的对应原句。"
-                        "evidence 必须从当前原文逐字复制，不得改写人称、标点或任何字符。"
-                        "四个字段始终都必须输出，confidence 始终必须是 0 到 1 的数字。"
-                        "无法从原文确定时输出 type=none，value 和 evidence 为空字符串。"
+                        "你是长期偏好抽取器。输入是一个已结束会话中的全部用户原文。"
+                        "只提取用户明确表达且适合长期保存的职业、喜欢和不喜欢。"
+                        "不要从助手文本或常识推断。只输出严格 JSON 对象 {preferences: [...]}。"
+                        "每项只能包含 event_id、type、value、evidence、confidence；"
+                        "type 只能是 occupation、likes、dislikes。event_id 必须引用对应原文，"
+                        "value 和 evidence 必须逐字来自该 event_id 的 text。没有结果返回空数组。"
                     ),
                 },
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
-                            "current_user_text": source_text,
+                            "user_messages": source_events,
                             "output_schema": {
-                                "type": "occupation | likes | dislikes | none",
-                                "value": "当前原文中的内容",
-                                "evidence": "当前原文中的对应原句",
-                                "confidence": 0.0,
+                                "preferences": [{
+                                    "event_id": 1,
+                                    "type": "occupation | likes | dislikes",
+                                    "value": "原文中的内容",
+                                    "evidence": "原文中的对应语句",
+                                    "confidence": 0.0,
+                                }]
                             },
                         },
                         ensure_ascii=False,
@@ -454,7 +424,8 @@ class PreferenceExtractor:
             content = data["choices"][0]["message"]["content"]
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("empty model output")
-            return content.strip()
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            return content.strip(), usage
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"preference extraction http {exc.code}: {body}") from exc
@@ -462,51 +433,62 @@ class PreferenceExtractor:
             raise RuntimeError(f"preference extraction failed: {exc}") from exc
 
     @staticmethod
-    def _validate_strict_output(raw: str, source_text: str) -> dict[str, Any]:
+    def _validate_session_output(raw: str, source_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         value = json.loads(raw)
-        if not isinstance(value, dict):
-            raise ValueError("output must be a JSON object")
-        required = {"type", "value", "evidence", "confidence"}
-        if set(value) != required:
-            raise ValueError("output fields must exactly match type/value/evidence/confidence")
-        preference_type = value["type"]
-        extracted_value = value["value"]
-        evidence = value["evidence"]
-        confidence = value["confidence"]
-        if preference_type not in {"occupation", "likes", "dislikes", "none"}:
-            raise ValueError("invalid preference type")
-        if not isinstance(extracted_value, str) or not isinstance(evidence, str):
-            raise ValueError("value and evidence must be strings")
-        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
-            raise ValueError("confidence must be a number in [0,1]")
-        extracted_value = extracted_value.strip()
-        evidence = evidence.strip()
-        if preference_type == "none":
-            if extracted_value or evidence:
-                raise ValueError("none output must have empty value and evidence")
-            if PreferenceExtractor._has_explicit_preference_signal(source_text):
-                raise ValueError("none is invalid for text with an explicit preference signal")
-        else:
-            if not extracted_value or not evidence:
-                raise ValueError("value and evidence cannot be empty")
-            if extracted_value not in source_text or evidence not in source_text or extracted_value not in evidence:
-                raise ValueError("value and evidence must come from the current user text")
-        return {
-            "type": preference_type,
-            "value": extracted_value,
-            "evidence": evidence,
-            "confidence": float(confidence),
-        }
+        if not isinstance(value, dict) or set(value) != {"preferences"}:
+            raise ValueError("output must contain only preferences")
+        items = value["preferences"]
+        if not isinstance(items, list):
+            raise ValueError("preferences must be an array")
+        source_by_id = {int(item["event_id"]): str(item["text"]) for item in source_events}
+        validated = []
+        seen: set[tuple[int, str, str]] = set()
+        required = {"event_id", "type", "value", "evidence", "confidence"}
+        for item in items:
+            if not isinstance(item, dict) or set(item) != required:
+                raise ValueError("preference fields must exactly match event_id/type/value/evidence/confidence")
+            event_id = item["event_id"]
+            if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id not in source_by_id:
+                raise ValueError("event_id is not part of the current session")
+            pref_type = item["type"]
+            extracted_value = item["value"]
+            evidence = item["evidence"]
+            confidence = item["confidence"]
+            if pref_type not in {"occupation", "likes", "dislikes"}:
+                raise ValueError("invalid preference type")
+            if not isinstance(extracted_value, str) or not isinstance(evidence, str):
+                raise ValueError("value and evidence must be strings")
+            if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+                raise ValueError("confidence must be a number in [0,1]")
+            extracted_value = extracted_value.strip()
+            evidence = evidence.strip()
+            source_text = source_by_id[event_id]
+            if not extracted_value or not evidence or extracted_value not in evidence or evidence not in source_text:
+                raise ValueError("value and evidence must come from the referenced user text")
+            identity = (event_id, pref_type, extracted_value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            validated.append({
+                "event_id": event_id,
+                "type": pref_type,
+                "value": extracted_value,
+                "evidence": evidence,
+                "confidence": float(confidence),
+            })
+        return validated
 
     @staticmethod
-    def _has_explicit_preference_signal(text: str) -> bool:
-        return bool(
-            re.search(
-                r"职业|工作身份|一名|我做.+工作|喜欢|喜爱|爱好|偏好|合胃口|"
-                r"不.{0,2}喜欢|不爱|讨厌|受不了|不舒服|避开|不要有",
-                text,
-            )
-        )
+    def _source_user_events(context: dict[str, Any]) -> list[dict[str, Any]]:
+        source = context.get("source_user_events")
+        if isinstance(source, list):
+            return [item for item in source if isinstance(item, dict)]
+        result: list[dict[str, Any]] = []
+        for turn in context.get("recent_turns") or []:
+            for message in turn.get("messages") or []:
+                if isinstance(message, dict) and message.get("role") == "user":
+                    result.append(message)
+        return result
 
     def extract_action_preferences(
         self,
@@ -586,10 +568,6 @@ class PreferenceExtractor:
             raise RuntimeError(f"action preference extraction http {exc.code}: {body}") from exc
         except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError(f"action preference extraction failed: {exc}") from exc
-
-
-def should_schedule_preference(text: str) -> bool:
-    return any(keyword in text for keyword in PREFERENCE_KEYWORDS)
 
 
 def normalize_preference_key(key: str) -> tuple[str, str]:

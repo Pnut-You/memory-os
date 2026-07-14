@@ -18,6 +18,8 @@ FastAPI + 原生 HTML/CSS/JavaScript 调试界面，不引入 React、Vue 或 No
 
 ```text
 POST /api/query
+GET /api/agent/memory-context
+POST /api/agent/conversation-turns
 GET /api/status
 GET /api/debug/users/{user_id}
 GET /api/debug/users/{user_id}/sessions
@@ -46,6 +48,26 @@ DELETE /api/debug/users/{user_id}/memory
   "query": "带我去安静一点的地方"
 }
 ```
+
+## 外部 Agent 接入
+
+Memory OS 不替外部 Agent 调模型。Agent 在推理前调用：
+
+```bash
+curl 'http://127.0.0.1:8000/api/agent/memory-context?user_id=user-001&device_id=dog-001'
+```
+
+返回当前内部 session 的 `rolling_summary`、`recent_messages`，以及严格按 `user_id + device_id` 隔离的 `active_preferences`。20 轮以内或尚未成功摘要时返回当前 session 全量原文；默认同时达到 20 轮和 5000 Prompt tokens 后后台摘要，摘要成功后保留最近 5 轮原文。
+
+Agent 生成最终回复后写入完整一轮：
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/agent/conversation-turns' \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"agent-turn-001","user_id":"user-001","device_id":"dog-001","user_text":"你好","assistant_text":"你好，我在。","prompt_token_count":5230}'
+```
+
+`prompt_token_count` 应填写外部 Agent 本次完整 Prompt 的实际 token 数，用于 5000-token 摘要阈值；省略时该轮不触发摘要。`request_id` 提供幂等保护；相同请求重试不会重复写入，不同内容复用 ID 返回 409。接口只写短期对话，不接受长期偏好。接口没有内置鉴权，只能放在可信内网或鉴权网关后面。
 
 ## 运行
 

@@ -52,17 +52,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jsonl", help="Legacy JSONL path; defaults to MEMORY_LOCAL_LONG_TERM_PATH")
     parser.add_argument("--sqlite", help="SQLite path; defaults to MEMORY_SQLITE_PATH")
+    parser.add_argument("--preference-user-id", help="Move this user's legacy preferences")
+    parser.add_argument("--preference-device-id", help="Target dog for legacy preferences")
     args = parser.parse_args()
+    if bool(args.preference_user_id) != bool(args.preference_device_id):
+        parser.error("--preference-user-id and --preference-device-id must be provided together")
     config = MemoryConfig.from_env()
     store = SQLiteEventStore(args.sqlite or config.sqlite_path)
     try:
         result = migrate_jsonl(store, args.jsonl or config.local_long_term_path)
+        moved_preferences = 0
+        if args.preference_user_id and args.preference_device_id:
+            moved_preferences = store.migrate_legacy_preferences(
+                args.preference_user_id,
+                args.preference_device_id,
+            )
         print(
             json.dumps(
                 {
                     "sqlite_migration_log": store.migration_log,
                     "jsonl": result,
                     "legacy_user_id": LEGACY_USER_ID,
+                    "moved_preferences": moved_preferences,
                 },
                 ensure_ascii=False,
             )

@@ -33,7 +33,7 @@ class MemoryDebugRouter:
         long_term_field = self.manager.classify_long_term_fact_query(query)
         retrieved_long_term_facts: dict[str, Any] | None = None
         if long_term_field:
-            assistant_reply, retrieved_long_term_facts = self.manager.answer_long_term_fact(user_id, long_term_field)
+            assistant_reply, retrieved_long_term_facts = self.manager.answer_long_term_fact(user_id, device_id, long_term_field)
             prompt_messages = [
                 {
                     "role": "system",
@@ -75,8 +75,8 @@ class MemoryDebugRouter:
                 assistant_reply,
                 model_event_routes=model_info.get("event_routes") if isinstance(model_info.get("event_routes"), list) else None,
                 session_id=context.get("session_id"),
+                timestamp=(context.get("session") or {}).get("last_activity_at"),
                 prompt_token_count=prompt_token_count,
-                schedule_preference_extraction=not bool(long_term_field),
             )
         except Exception as exc:
             logger.exception("chat.persistence_failed request_id=%s user_id=%s device_id=%s", request_id, user_id, device_id)
@@ -123,6 +123,43 @@ class MemoryDebugRouter:
                 ),
             }
         return result
+
+    def agent_memory_context(self, user_id: str, device_id: str) -> dict[str, Any]:
+        context = self.manager.get_conversation_context(user_id, device_id)
+        active_preferences = self.manager.events.list_preferences(
+            user_id,
+            status="active",
+            device_id=device_id,
+            limit=100,
+        )
+        return {
+            "user_id": user_id,
+            "device_id": device_id,
+            "session_id": context["session_id"],
+            "rolling_summary": context["rolling_summary"],
+            "summary_version": context["summary_version"],
+            "summary_pending": context["summary_pending"],
+            "recent_messages": context["recent_messages"],
+            "active_preferences": active_preferences,
+        }
+
+    def add_agent_conversation_turn(
+        self,
+        request_id: str,
+        user_id: str,
+        device_id: str,
+        user_text: str,
+        assistant_text: str,
+        prompt_token_count: int | None = None,
+    ) -> dict[str, Any]:
+        return self.manager.add_agent_conversation_turn(
+            request_id,
+            user_id,
+            device_id,
+            user_text,
+            assistant_text,
+            prompt_token_count,
+        )
 
     def _build_prompt_messages(
         self,
@@ -384,7 +421,9 @@ class MemoryDebugRouter:
         if not device_id:
             return self.manager.events.list_preferences(user_id, status=status, limit=limit)
         primary_keys = {"profile.occupation", "preference.likes", "preference.dislikes"}
-        user_primary = self.manager.events.list_primary_preferences(user_id, status=status, limit=limit)
+        user_primary = self.manager.events.list_primary_preferences(
+            user_id, status=status, device_id=device_id, limit=limit
+        )
         device_preferences = [
             item
             for item in self.manager.events.list_preferences(

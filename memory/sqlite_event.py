@@ -198,6 +198,7 @@ class SQLiteEventStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
                 device_id TEXT,
+                session_id TEXT,
                 job_type TEXT NOT NULL,
                 from_event_id INTEGER,
                 to_event_id INTEGER,
@@ -211,8 +212,8 @@ class SQLiteEventStore:
                 CHECK (status IN ('pending','running','succeeded','failed'))
             );
             CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_preference_job
-                ON memory_jobs(user_id, job_type)
-                WHERE job_type='preference_extraction' AND status IN ('pending','running');
+                ON memory_jobs(user_id, device_id, session_id, job_type)
+                WHERE job_type='preference_extraction' AND session_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_jobs_ready
                 ON memory_jobs(status, available_at, id);
 
@@ -257,6 +258,7 @@ class SQLiteEventStore:
         self._ensure_column("user_preferences", "scope", "TEXT NOT NULL DEFAULT 'user'")
         self._ensure_column("user_preferences", "device_id", "TEXT NOT NULL DEFAULT 'legacy-unassigned'")
         self._migrate_primary_preferences_to_user_scope()
+        self._ensure_column("memory_jobs", "session_id", "TEXT")
         self._ensure_preference_device_indexes()
         self._ensure_column("events", "session_id", "TEXT")
         self._conn.execute(
@@ -395,6 +397,16 @@ class SQLiteEventStore:
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def get_message_pair(self, request_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM events
+                WHERE request_id=? AND role IN ('user','assistant')
+                ORDER BY id""",
+                (request_id,),
+            ).fetchall()
+        return [self._decode_row(row, ("payload_json",)) for row in rows]
 
     def add_event(
         self,
@@ -1284,10 +1296,8 @@ class SQLiteEventStore:
         device_id: str | None = None,
     ) -> int | None:
         now = iso_now()
-        primary_keys = {"profile.occupation", "preference.likes", "preference.dislikes"}
-        preference_device_id = LEGACY_USER_ID if preference_key in primary_keys else (device_id or LEGACY_USER_ID)
-        if preference_key in primary_keys:
-            scope = "user"
+        preference_device_id = device_id or LEGACY_USER_ID
+        scope = "device"
         value_type = str(value.get("type") or "json")
         value_json = self._json(value)
         target_status = status or ("active" if source_type == "explicit" and confidence >= 0.85 else "candidate")
@@ -1425,8 +1435,7 @@ class SQLiteEventStore:
         device_id: str | None = None,
     ) -> None:
         value_json = self._json(value) if value is not None else None
-        primary_keys = {"profile.occupation", "preference.likes", "preference.dislikes"}
-        preference_device_id = LEGACY_USER_ID if preference_key in primary_keys else (device_id or LEGACY_USER_ID)
+        preference_device_id = device_id or LEGACY_USER_ID
         if preference_key in {"preference.likes", "preference.dislikes"} and value is None:
             return
         with self._lock:
@@ -1608,11 +1617,12 @@ class SQLiteEventStore:
         user_id: str,
         preference_key: str | None = None,
         *,
+        device_id: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         keys = ("profile.occupation", "preference.likes", "preference.dislikes")
-        params: list[Any] = [user_id, LEGACY_USER_ID]
-        where = "WHERE user_id=? AND device_id=? AND status='active' AND scope='user'"
+        params: list[Any] = [user_id, device_id or LEGACY_USER_ID]
+        where = "WHERE user_id=? AND device_id=? AND status='active'"
         if preference_key is not None:
             if preference_key not in keys:
                 return []
@@ -1634,11 +1644,12 @@ class SQLiteEventStore:
         user_id: str,
         status: str | None = None,
         *,
+        device_id: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        params: list[Any] = [user_id, LEGACY_USER_ID]
+        params: list[Any] = [user_id, device_id or LEGACY_USER_ID]
         where = (
-            "WHERE user_id=? AND device_id=? AND scope='user' "
+            "WHERE user_id=? AND device_id=? "
             "AND preference_key IN ('profile.occupation','preference.likes','preference.dislikes')"
         )
         if status:
@@ -1685,26 +1696,27 @@ class SQLiteEventStore:
         from_event_id: int | None = None,
         to_event_id: int | None = None,
         available_at: str | None = None,
+        session_id: str | None = None,
     ) -> int | None:
         now = iso_now()
         with self._lock:
             try:
                 cursor = self._conn.execute(
                     """INSERT INTO memory_jobs
-                    (user_id,device_id,job_type,from_event_id,to_event_id,status,available_at,created_at,updated_at)
-                    VALUES(?,?,?,?,?,'pending',?,?,?)""",
-                    (user_id, device_id, job_type, from_event_id, to_event_id, available_at or now, now, now),
+                    (user_id,device_id,session_id,job_type,from_event_id,to_event_id,status,available_at,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,'pending',?,?,?)""",
+                    (user_id, device_id, session_id, job_type, from_event_id, to_event_id, available_at or now, now, now),
                 )
                 self._conn.commit()
                 return int(cursor.lastrowid)
             except sqlite3.IntegrityError:
                 self._conn.rollback()
-                if job_type == "preference_extraction":
+                if job_type == "preference_extraction" and session_id:
                     self._conn.execute(
                         """UPDATE memory_jobs SET to_event_id=MAX(COALESCE(to_event_id,0),?),
                         updated_at=? WHERE user_id=? AND COALESCE(device_id,'')=COALESCE(?,'')
-                        AND job_type=? AND status IN ('pending','running')""",
-                        (to_event_id or 0, now, user_id, device_id, job_type),
+                        AND session_id=? AND job_type=? AND status IN ('pending','running')""",
+                        (to_event_id or 0, now, user_id, device_id, session_id, job_type),
                     )
                     self._conn.commit()
                     return None
@@ -1831,11 +1843,12 @@ class SQLiteEventStore:
                         SELECT 1 FROM memory_jobs active
                         WHERE active.user_id=memory_jobs.user_id
                             AND COALESCE(active.device_id,'')=COALESCE(memory_jobs.device_id,'')
+                            AND COALESCE(active.session_id,'')=COALESCE(memory_jobs.session_id,'')
                             AND active.job_type=memory_jobs.job_type
                             AND active.status IN ('pending','running')
                             AND active.id != memory_jobs.id
                     )
-                    GROUP BY user_id, COALESCE(device_id,''), job_type
+                    GROUP BY user_id, COALESCE(device_id,''), COALESCE(session_id,''), job_type
                 )
                 ORDER BY id LIMIT ?""",
                 params,
@@ -2118,47 +2131,38 @@ class SQLiteEventStore:
             )
             self._conn.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_preference_job
-                ON memory_jobs(user_id, device_id, job_type)
-                WHERE job_type='preference_extraction' AND status IN ('pending','running')"""
+                ON memory_jobs(user_id, device_id, session_id, job_type)
+                WHERE job_type='preference_extraction' AND session_id IS NOT NULL"""
             )
             self._conn.commit()
 
     def _migrate_primary_preferences_to_user_scope(self) -> None:
-        keys = ("profile.occupation", "preference.likes", "preference.dislikes")
-        placeholders = ",".join("?" for _ in keys)
+        # Legacy rows are bound to a real dog only by the explicit migration command.
+        return
+
+    def migrate_legacy_preferences(self, user_id: str, device_id: str) -> int:
         with self._lock:
             rows = self._conn.execute(
-                f"""SELECT id,user_id,preference_key,value_json,status,updated_at
-                FROM user_preferences
-                WHERE preference_key IN ({placeholders})
-                ORDER BY updated_at DESC,id DESC""",
-                keys,
+                "SELECT id FROM user_preferences WHERE user_id=? AND device_id=? ORDER BY id",
+                (user_id, LEGACY_USER_ID),
             ).fetchall()
-            active_seen: set[tuple[str, str, str]] = set()
-            superseded: list[int] = []
+            moved = 0
             for row in rows:
-                if str(row["status"]) != "active":
-                    continue
-                key = str(row["preference_key"])
-                value_identity = "single" if key == "profile.occupation" else str(row["value_json"])
-                identity = (str(row["user_id"]), key, value_identity)
-                if identity in active_seen:
-                    superseded.append(int(row["id"]))
-                else:
-                    active_seen.add(identity)
-            if superseded:
-                marks = ",".join("?" for _ in superseded)
-                self._conn.execute(
-                    f"UPDATE user_preferences SET status='superseded',updated_at=? WHERE id IN ({marks})",
-                    [iso_now(), *superseded],
-                )
-            self._conn.execute(
-                f"""UPDATE user_preferences
-                SET device_id=?,scope='user'
-                WHERE preference_key IN ({placeholders})""",
-                (LEGACY_USER_ID, *keys),
-            )
+                pref_id = int(row["id"])
+                try:
+                    self._conn.execute(
+                        "UPDATE user_preferences SET device_id=?,scope='device',updated_at=? WHERE id=?",
+                        (device_id, iso_now(), pref_id),
+                    )
+                except sqlite3.IntegrityError:
+                    self._conn.execute(
+                        """UPDATE user_preferences
+                        SET status='superseded',device_id=?,scope='device',updated_at=? WHERE id=?""",
+                        (device_id, iso_now(), pref_id),
+                    )
+                moved += 1
             self._conn.commit()
+            return moved
 
     def _ensure_memory_jobs_accepts_extraction_types(self) -> None:
         row = self._conn.execute(
@@ -2175,6 +2179,7 @@ class SQLiteEventStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
                     device_id TEXT,
+                    session_id TEXT,
                     job_type TEXT NOT NULL,
                     from_event_id INTEGER,
                     to_event_id INTEGER,
@@ -2191,17 +2196,17 @@ class SQLiteEventStore:
             )
             self._conn.execute(
                 """INSERT INTO memory_jobs
-                (id,user_id,device_id,job_type,from_event_id,to_event_id,status,attempts,
+                (id,user_id,device_id,session_id,job_type,from_event_id,to_event_id,status,attempts,
                  available_at,locked_at,last_error,created_at,updated_at)
-                SELECT id,user_id,device_id,job_type,from_event_id,to_event_id,status,attempts,
+                SELECT id,user_id,device_id,NULL,job_type,from_event_id,to_event_id,status,attempts,
                     available_at,locked_at,last_error,created_at,updated_at
                 FROM memory_jobs_old"""
             )
             self._conn.execute("DROP TABLE memory_jobs_old")
             self._conn.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_preference_job
-                ON memory_jobs(user_id, device_id, job_type)
-                WHERE job_type='preference_extraction' AND status IN ('pending','running')"""
+                ON memory_jobs(user_id, device_id, session_id, job_type)
+                WHERE job_type='preference_extraction' AND session_id IS NOT NULL"""
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_ready ON memory_jobs(status, available_at, id)"
