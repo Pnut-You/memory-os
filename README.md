@@ -262,12 +262,24 @@ Worker 的真实数据流：
 curl 'http://127.0.0.1:8000/api/agent/memory-context?user_id=user-001&device_id=dog-001'
 ```
 
-响应中的 `rolling_summary` 是当前内部 session 已完成的滚动摘要，`recent_messages` 是摘要之后仍保留的 user/assistant 原文，`active_preferences` 是完全匹配该 `user_id + device_id` 的全部 active 长期偏好。`session_id` 只用于诊断，外部不传回。
+响应已经整理为可直接交给 Agent 的精简 JSON：
 
-- 未生成摘要时，`rolling_summary` 为空，`recent_messages` 返回当前 session 全量原文。
-- 默认达到 20 轮且完整 Prompt 估算达到 5000 tokens 后才在后台摘要。
-- 摘要成功后返回摘要和最近 5 轮原文；摘要等待或失败时仍返回尚未压缩的原文。
-- Redis 缓存丢失时从 SQLite 恢复；生产 Redis 故障直接报错。
+```json
+{
+  "user_id": "user-001",
+  "device_id": "dog-001",
+  "long_term_memory": "个人信息：\n用户的职业是程序员。\n\n偏好：\n用户的偏好包括：健身、游泳。\n\n不喜欢：\n用户不喜欢：香菜。",
+  "short_term_memory": {
+    "session_id": "sess-fde9898e9d294e2a96b654453fb78a48",
+    "messages": [
+      {"role": "user", "content": "你好"},
+      {"role": "assistant", "content": "你好，我在。"}
+    ]
+  }
+}
+```
+
+`long_term_memory` 是可直接放入 Agent system prompt 的字符串，固定分为“个人信息、偏好、不喜欢”三层，只使用完全匹配该 `user_id + device_id` 的 active 长期记忆。每层内容会去重；没有记录时显示“暂无已确认信息。”。`short_term_memory.messages` 严格来自当前内部 session，不会在空 session 时回退到历史 session。`session_id` 只用于诊断，外部不传回。Redis 缓存丢失时数据会从 SQLite 恢复；生产 Redis 故障直接报错。
 
 Agent 得到最终回复后写入一轮短期对话：
 
@@ -422,6 +434,8 @@ uv run python -c "import fastapi, redis, pydantic; print('dependencies ok')"
 uv run python -m unittest discover -s tests -v
 uv run python example.py
 ```
+
+`example.py` 只读取并展示已有记忆，不会写入示例对话或长期偏好，也不会污染当前 SQLite 数据。
 
 短期记忆在当前 session 未触发滚动摘要前不会裁剪原文对话：20 轮以内全部进入回复 prompt；达到 20 轮后，只有完整 prompt 估算达到 `SHORT_MEMORY_PROMPT_TRIGGER_TOKENS` 时才摘要较早对话，并保留最近 `SHORT_MEMORY_RETAIN_RECENT_TURNS` 轮原文。评测会先把每个 Case 的前置对话写入当前 session，再调用一次回复模型回答追问。默认数据集共 400 条，由 200 条 2-10 轮数据和 200 条 10-20 轮数据组成，Case ID 为 `short_001` 至 `short_400`。默认命令严格使用 Redis，Redis 不可用时会失败：
 

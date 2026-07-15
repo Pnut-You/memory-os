@@ -154,6 +154,12 @@ class RecallNameLLM(FakeLLM):
 
 
 class MemorySystemTests(unittest.TestCase):
+    def test_example_does_not_write_demo_memory(self):
+        source = (Path(__file__).parents[1] / "example.py").read_text(encoding="utf-8")
+        self.assertNotIn("add_conversation_turn", source)
+        self.assertNotIn("upsert_preference", source)
+        self.assertNotIn("安静一点的路线", source)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
@@ -256,13 +262,59 @@ class MemorySystemTests(unittest.TestCase):
                     confidence=0.95,
                     device_id=dog,
                 )
+            manager.events.upsert_preference(
+                "user-001",
+                "profile.occupation",
+                "profile",
+                {"type": "string", "value": "程序员"},
+                "程序员",
+                [],
+                confidence=0.95,
+                device_id="dog-001",
+            )
+            manager.events.upsert_preference(
+                "user-001",
+                "preference.dislikes",
+                "preference",
+                {"type": "string", "value": "香菜"},
+                "不喜欢吃香菜",
+                [],
+                confidence=0.95,
+                device_id="dog-001",
+            )
             context = router.agent_memory_context("user-001", "dog-001")
-            self.assertEqual([item["content"] for item in context["recent_messages"]], [
-                "当前狗的短期消息", "收到"
-            ])
             self.assertEqual(
-                {item["display_text_zh"] for item in context["active_preferences"]},
-                {"飞盘"},
+                context,
+                {
+                    "user_id": "user-001",
+                    "device_id": "dog-001",
+                    "long_term_memory": (
+                        "个人信息：\n用户的职业是程序员。\n\n"
+                        "偏好：\n用户的偏好包括：飞盘。\n\n"
+                        "不喜欢：\n用户不喜欢：香菜。"
+                    ),
+                    "short_term_memory": {
+                        "session_id": context["short_term_memory"]["session_id"],
+                        "messages": [
+                            {"role": "user", "content": "当前狗的短期消息"},
+                            {"role": "assistant", "content": "收到"},
+                        ],
+                    },
+                },
+            )
+        finally:
+            manager.close()
+
+    def test_agent_memory_prompt_keeps_empty_three_layer_structure(self):
+        manager = self.make_manager()
+        router = MemoryDebugRouter(manager, FakeLLM())
+        try:
+            context = router.agent_memory_context("empty-user", "dog-001")
+            self.assertEqual(
+                context["long_term_memory"],
+                "个人信息：\n暂无已确认信息。\n\n"
+                "偏好：\n暂无已确认信息。\n\n"
+                "不喜欢：\n暂无已确认信息。",
             )
         finally:
             manager.close()

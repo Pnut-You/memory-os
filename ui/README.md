@@ -57,7 +57,7 @@ Memory OS 不替外部 Agent 调模型。Agent 在推理前调用：
 curl 'http://127.0.0.1:8000/api/agent/memory-context?user_id=user-001&device_id=dog-001'
 ```
 
-返回当前内部 session 的 `rolling_summary`、`recent_messages`，以及严格按 `user_id + device_id` 隔离的 `active_preferences`。20 轮以内或尚未成功摘要时返回当前 session 全量原文；默认同时达到 20 轮和 5000 Prompt tokens 后后台摘要，摘要成功后保留最近 5 轮原文。
+返回可直接交给 Agent 的精简 JSON：`long_term_memory` 是严格按 `user_id + device_id` 隔离并整理为“个人信息、偏好、不喜欢”三层的完整提示词字符串；`short_term_memory` 包含当前内部 session 的 `session_id` 和 `role/content` 消息。空 session 返回空消息，不会回退到历史 session。
 
 Agent 生成最终回复后写入完整一轮：
 
