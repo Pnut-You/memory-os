@@ -135,13 +135,64 @@ class MemoryDebugRouter:
         return {
             "user_id": user_id,
             "device_id": device_id,
-            "session_id": context["session_id"],
-            "rolling_summary": context["rolling_summary"],
-            "summary_version": context["summary_version"],
-            "summary_pending": context["summary_pending"],
-            "recent_messages": context["recent_messages"],
-            "active_preferences": active_preferences,
+            "long_term_memory": self._agent_long_term_prompt(active_preferences),
+            "short_term_memory": {
+                "session_id": context["session_id"],
+                "messages": [
+                    {
+                        "role": str(item.get("role") or ""),
+                        "content": str(item.get("content") or ""),
+                    }
+                    for item in context["recent_messages"]
+                ],
+            },
         }
+
+    @staticmethod
+    def _agent_preference_value(preference: dict[str, Any]) -> str:
+        value = preference.get("value_json")
+        if not isinstance(value, dict):
+            value = {}
+        return str(
+            value.get("value")
+            or value.get("label_zh")
+            or value.get("code")
+            or preference.get("display_text_zh")
+            or ""
+        )
+
+    @classmethod
+    def _agent_long_term_prompt(cls, preferences: list[dict[str, Any]]) -> str:
+        profile: list[str] = []
+        likes: list[str] = []
+        dislikes: list[str] = []
+        for preference in preferences:
+            key = str(preference.get("preference_key") or "")
+            value = cls._agent_preference_value(preference).strip()
+            if not value:
+                continue
+            if key == "profile.occupation":
+                text = f"用户的职业是{value}。"
+                if text not in profile:
+                    profile.append(text)
+            elif key.startswith("profile."):
+                text = str(preference.get("display_text_zh") or value).strip()
+                if text and text not in profile:
+                    profile.append(text)
+            elif key == "preference.dislikes":
+                if value not in dislikes:
+                    dislikes.append(value)
+            elif value not in likes:
+                likes.append(value)
+
+        profile_text = "".join(profile) if profile else "暂无已确认信息。"
+        likes_text = f"用户的偏好包括：{'、'.join(likes)}。" if likes else "暂无已确认信息。"
+        dislikes_text = f"用户不喜欢：{'、'.join(dislikes)}。" if dislikes else "暂无已确认信息。"
+        return (
+            f"个人信息：\n{profile_text}\n\n"
+            f"偏好：\n{likes_text}\n\n"
+            f"不喜欢：\n{dislikes_text}"
+        )
 
     def add_agent_conversation_turn(
         self,
