@@ -340,8 +340,8 @@ class MemoryDebugRouter:
             {
                 "name": "daily_memory_extraction",
                 "title_zh": "日期总结抽取",
-                "status": "queued" if daily_extraction else "skipped",
-                "data": daily_extraction or {"reason": "daily extraction was not queued"},
+                "status": "deferred" if daily_extraction else "skipped",
+                "data": daily_extraction or {"reason": "daily extraction was not scheduled"},
             },
             {
                 "name": "action_event_routing",

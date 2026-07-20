@@ -61,6 +61,9 @@ class MemoryConfig:
     preference_extract_batch_size: int = 8
     preference_extract_min_new_user_messages: int = 10
     preference_extract_max_attempts: int = 3
+    memory_schedule_time: str = "01:00"
+    memory_schedule_timezone: str = "Asia/Shanghai"
+    memory_schedule_backfill_days: int = 30
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "MemoryConfig":
@@ -73,6 +76,13 @@ class MemoryConfig:
         long_term_extractor_mode = os.getenv("LONG_TERM_EXTRACTOR_MODE", "small").strip().lower()
         if long_term_extractor_mode not in {"small", "hybrid", "large"}:
             raise ValueError("LONG_TERM_EXTRACTOR_MODE must be small, hybrid, or large")
+        memory_schedule_time = os.getenv("MEMORY_SCHEDULE_TIME", "01:00").strip()
+        try:
+            schedule_hour, schedule_minute = (int(part) for part in memory_schedule_time.split(":"))
+        except (TypeError, ValueError):
+            raise ValueError("MEMORY_SCHEDULE_TIME must use HH:MM format") from None
+        if not (0 <= schedule_hour <= 23 and 0 <= schedule_minute <= 59):
+            raise ValueError("MEMORY_SCHEDULE_TIME must use a valid 24-hour time")
         return cls(
             data_dir=data_dir,
             sqlite_path=Path(os.getenv("MEMORY_SQLITE_PATH", str(data_dir / "events.db"))),
@@ -128,6 +138,12 @@ class MemoryConfig:
                 1, int(os.getenv("PREFERENCE_EXTRACT_MIN_NEW_USER_MESSAGES", "10"))
             ),
             preference_extract_max_attempts=max(1, int(os.getenv("PREFERENCE_EXTRACT_MAX_ATTEMPTS", "3"))),
+            memory_schedule_time=f"{schedule_hour:02d}:{schedule_minute:02d}",
+            memory_schedule_timezone=os.getenv("MEMORY_SCHEDULE_TIMEZONE", "Asia/Shanghai").strip()
+            or "Asia/Shanghai",
+            memory_schedule_backfill_days=max(
+                1, int(os.getenv("MEMORY_SCHEDULE_BACKFILL_DAYS", "30"))
+            ),
         )
 
     def ensure_directories(self) -> None:

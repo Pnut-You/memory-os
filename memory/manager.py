@@ -54,6 +54,9 @@ class MemoryManager:
         short_memory_summary_min_turns: int | None = None,
         short_memory_prompt_trigger_tokens: int = 5000,
         short_memory_retain_recent_turns: int | None = None,
+        memory_schedule_time: str = "01:00",
+        memory_schedule_timezone: str = "Asia/Shanghai",
+        memory_schedule_backfill_days: int = 30,
     ) -> None:
         self.redis = short_term
         self.events = events
@@ -81,6 +84,17 @@ class MemoryManager:
         self.preference_extract_max_attempts = max(1, preference_extract_max_attempts)
         self.session_idle_seconds = max(1, session_idle_seconds)
         self.session_ttl_seconds = max(60, session_ttl_seconds)
+        try:
+            schedule_hour, schedule_minute = (int(part) for part in memory_schedule_time.split(":"))
+        except (TypeError, ValueError):
+            raise ValueError("memory_schedule_time must use HH:MM format") from None
+        if not (0 <= schedule_hour <= 23 and 0 <= schedule_minute <= 59):
+            raise ValueError("memory_schedule_time must use a valid 24-hour time")
+        self.memory_schedule_hour = schedule_hour
+        self.memory_schedule_minute = schedule_minute
+        self.memory_schedule_timezone = memory_schedule_timezone
+        self._memory_schedule_zone = ZoneInfo(memory_schedule_timezone)
+        self.memory_schedule_backfill_days = max(1, memory_schedule_backfill_days)
         self._conversation_states: dict[tuple[str, str], _ConversationState] = {}
         self._summary_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-summary")
         self._summary_futures: set[Future[Any]] = set()
@@ -134,6 +148,9 @@ class MemoryManager:
             short_memory_summary_min_turns=config.short_memory_summary_min_turns,
             short_memory_prompt_trigger_tokens=config.short_memory_prompt_trigger_tokens,
             short_memory_retain_recent_turns=config.short_memory_retain_recent_turns,
+            memory_schedule_time=config.memory_schedule_time,
+            memory_schedule_timezone=config.memory_schedule_timezone,
+            memory_schedule_backfill_days=config.memory_schedule_backfill_days,
         )
         if start_scheduler:
             manager.start_memory_worker()
@@ -248,6 +265,7 @@ class MemoryManager:
         def _loop() -> None:
             while not self._job_stop.wait(poll_seconds):
                 try:
+                    self.schedule_due_memory_jobs()
                     self.process_memory_jobs_once(include_daily=True)
                 except Exception:
                     logger.exception("memory_job.worker_failed")
@@ -361,7 +379,14 @@ class MemoryManager:
                 )
             )
         memory_date = self._local_date(timestamp)
-        daily_jobs = self._schedule_daily_extraction(user_id, device_id, memory_date, user_event_id, assistant_event_id)
+        daily_jobs = {
+            "memory_date": memory_date,
+            "from_event_id": max(0, min(user_event_id, assistant_event_id) - 1),
+            "to_event_id": max(user_event_id, assistant_event_id),
+            "queued": [],
+            "deferred": True,
+            "reason": "daily extraction is scheduled after the local date ends",
+        }
         self._schedule_summary(
             user_id,
             device_id,
@@ -691,6 +716,132 @@ class MemoryManager:
         if card is None:
             self.redis.delete_key(self.redis.user_card_key(user_id, device_id))
         return card
+
+    def schedule_due_memory_jobs(self, now: datetime | None = None) -> dict[str, Any]:
+        """Idempotently enqueue completed daily and weekly long-term-memory periods."""
+        current = now or datetime.now(self._memory_schedule_zone)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=self._memory_schedule_zone)
+        else:
+            current = current.astimezone(self._memory_schedule_zone)
+        scheduled_minutes = self.memory_schedule_hour * 60 + self.memory_schedule_minute
+        current_minutes = current.hour * 60 + current.minute
+        days_back = 1 if current_minutes >= scheduled_minutes else 2
+        end_date = current.date() - timedelta(days=days_back)
+        start_date = end_date - timedelta(days=self.memory_schedule_backfill_days - 1)
+        start_text = start_date.isoformat()
+        end_text = end_date.isoformat()
+        scopes = self.events.list_conversation_scopes(
+            start_text, end_text, self.memory_schedule_timezone
+        )
+        created_daily: list[dict[str, Any]] = []
+        for scope in scopes:
+            user_id = str(scope["user_id"])
+            device_id = str(scope["device_id"])
+            memory_date = str(scope["local_date"])
+            if user_id in {"anonymous", LEGACY_USER_ID}:
+                continue
+            source_events: list[dict[str, Any]] = []
+            for event_type in ("message", "action_sequence", "action_feedback"):
+                source_events.extend(
+                    self.events.list_events_for_local_date(
+                        user_id, device_id, memory_date, event_type=event_type
+                    )
+                )
+            source_ids = [int(event["id"]) for event in source_events]
+            if not source_ids:
+                continue
+            from_event_id = max(0, min(source_ids) - 1)
+            to_event_id = max(source_ids)
+            for job_type in ("daily_time_memory_extract", "daily_action_memory_extract"):
+                job_id = self.events.enqueue_job(
+                    user_id,
+                    job_type,
+                    device_id=device_id,
+                    from_event_id=from_event_id,
+                    to_event_id=to_event_id,
+                    schedule_key=memory_date,
+                    period_start=memory_date,
+                    period_end=memory_date,
+                )
+                if job_id is not None:
+                    created_daily.append(
+                        {
+                            "job_id": job_id,
+                            "job_type": job_type,
+                            "user_id": user_id,
+                            "device_id": device_id,
+                            "memory_date": memory_date,
+                        }
+                    )
+
+        created_weekly: list[dict[str, Any]] = []
+        sunday = start_date
+        while sunday.weekday() != 6:
+            sunday += timedelta(days=1)
+        while sunday <= end_date:
+            monday = sunday - timedelta(days=6)
+            if monday >= start_date:
+                week_scopes = self.events.list_conversation_scopes(
+                    monday.isoformat(), sunday.isoformat(), self.memory_schedule_timezone
+                )
+                by_pair: dict[tuple[str, str], set[str]] = {}
+                for scope in week_scopes:
+                    user_id = str(scope["user_id"])
+                    device_id = str(scope["device_id"])
+                    if user_id in {"anonymous", LEGACY_USER_ID}:
+                        continue
+                    by_pair.setdefault((user_id, device_id), set()).add(
+                        str(scope["local_date"])
+                    )
+                for (user_id, device_id), active_dates in by_pair.items():
+                    daily_keys = sorted(active_dates)
+                    if not self.events.scheduled_jobs_succeeded(
+                        user_id,
+                        device_id,
+                        "daily_action_memory_extract",
+                        daily_keys,
+                    ):
+                        continue
+                    action_memories: list[dict[str, Any]] = []
+                    for memory_date in daily_keys:
+                        action_memories.extend(
+                            self.events.list_action_memories(
+                                user_id, device_id, memory_date=memory_date, limit=500
+                            )
+                        )
+                    action_ids = [int(event["id"]) for event in action_memories]
+                    schedule_key = f"{monday.isoformat()}:{sunday.isoformat()}"
+                    job_id = self.events.enqueue_job(
+                        user_id,
+                        "weekly_action_preference_extract",
+                        device_id=device_id,
+                        from_event_id=max(0, min(action_ids) - 1) if action_ids else None,
+                        to_event_id=max(action_ids) if action_ids else None,
+                        schedule_key=schedule_key,
+                        period_start=monday.isoformat(),
+                        period_end=sunday.isoformat(),
+                    )
+                    if job_id is not None:
+                        created_weekly.append(
+                            {
+                                "job_id": job_id,
+                                "job_type": "weekly_action_preference_extract",
+                                "user_id": user_id,
+                                "device_id": device_id,
+                                "start_date": monday.isoformat(),
+                                "end_date": sunday.isoformat(),
+                            }
+                        )
+            sunday += timedelta(days=7)
+        return {
+            "timezone": self.memory_schedule_timezone,
+            "schedule_time": f"{self.memory_schedule_hour:02d}:{self.memory_schedule_minute:02d}",
+            "backfill_start": start_text,
+            "backfill_end": end_text,
+            "daily_created": created_daily,
+            "weekly_created": created_weekly,
+        }
 
     def process_memory_jobs_once(self, limit: int | None = None, include_daily: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -1213,42 +1364,6 @@ class MemoryManager:
             self.redis.set_json(self.redis.summary_key(user_id, device_id, session_id), summary, self.redis.ttl_seconds)
         return summary
 
-    def _schedule_daily_extraction(
-        self,
-        user_id: str,
-        device_id: str,
-        memory_date: str,
-        user_event_id: int,
-        assistant_event_id: int,
-    ) -> dict[str, Any]:
-        if user_id in {"anonymous", LEGACY_USER_ID}:
-            return {
-                "memory_date": memory_date,
-                "from_event_id": max(0, min(user_event_id, assistant_event_id) - 1),
-                "to_event_id": max(user_event_id, assistant_event_id),
-                "queued": [],
-                "skipped": True,
-                "reason": "user is not eligible for daily extraction",
-            }
-        from_event_id = max(0, min(user_event_id, assistant_event_id) - 1)
-        to_event_id = max(user_event_id, assistant_event_id)
-        queued = []
-        for job_type in ("daily_time_memory_extract",):
-            job_id = self.events.upsert_pending_device_job(
-                user_id,
-                device_id,
-                job_type,
-                from_event_id=from_event_id,
-                to_event_id=to_event_id,
-            )
-            queued.append({"job_type": job_type, "job_id": job_id})
-        return {
-            "memory_date": memory_date,
-            "from_event_id": from_event_id,
-            "to_event_id": to_event_id,
-            "queued": queued,
-        }
-
     def _schedule_summary(
         self,
         user_id: str,
@@ -1725,19 +1840,51 @@ class MemoryManager:
         from_id = int(job.get("from_event_id") or 0)
         to_id = int(job.get("to_event_id") or 0)
         device_id = str(job.get("device_id") or "")
-        action_memories = [
-            event
-            for event in self.events.list_events(user_id=user_id, device_id=device_id or None, event_type="action_memory", limit=1000, ascending=True)
-            if from_id < int(event["id"]) <= to_id
-        ]
+        period_start = str(job.get("period_start") or "")
+        period_end = str(job.get("period_end") or "")
+        if period_start and period_end:
+            action_memories = []
+            current_date = datetime.fromisoformat(period_start).date()
+            last_date = datetime.fromisoformat(period_end).date()
+            while current_date <= last_date:
+                action_memories.extend(
+                    self.events.list_action_memories(
+                        user_id,
+                        device_id,
+                        memory_date=current_date.isoformat(),
+                        limit=500,
+                    )
+                )
+                current_date += timedelta(days=1)
+        else:
+            action_memories = [
+                event
+                for event in self.events.list_events(
+                    user_id=user_id,
+                    device_id=device_id or None,
+                    event_type="action_memory",
+                    limit=1000,
+                    ascending=True,
+                )
+                if from_id < int(event["id"]) <= to_id
+            ]
         if not action_memories:
-            return {"skipped": True, "reason": "no action_memory events in extraction range", "from_event_id": from_id, "to_event_id": to_id}
+            return {
+                "skipped": True,
+                "reason": "no action_memory events in extraction range",
+                "from_event_id": from_id,
+                "to_event_id": to_id,
+                "start_date": period_start or None,
+                "end_date": period_end or None,
+            }
         return self._run_weekly_action_preference_extraction(
             user_id,
             device_id,
             action_memories,
             from_event_id=from_id,
             to_event_id=to_id,
+            period_start=period_start or None,
+            period_end=period_end or None,
         )
 
     def _run_weekly_action_preference_extraction(
@@ -1748,6 +1895,8 @@ class MemoryManager:
         *,
         from_event_id: int | None = None,
         to_event_id: int | None = None,
+        period_start: str | None = None,
+        period_end: str | None = None,
     ) -> dict[str, Any]:
         dates = sorted(
             {
@@ -1755,8 +1904,8 @@ class MemoryManager:
                 for event in action_memories
             }
         )
-        start_date = dates[0]
-        end_date = dates[-1]
+        start_date = period_start or dates[0]
+        end_date = period_end or dates[-1]
         extraction = self._extract_weekly_action_preferences(user_id, device_id, action_memories, start_date, end_date)
         memories = extraction["memories"]
         event_ids = self.events.replace_weekly_action_preference_memories(
@@ -1850,6 +1999,8 @@ class MemoryManager:
     def _job_memory_date(self, job: dict[str, Any]) -> str:
         if job.get("memory_date"):
             return str(job["memory_date"])
+        if job.get("period_start"):
+            return str(job["period_start"])
         event_id = int(job.get("to_event_id") or 0)
         event = self.events.get_event(event_id) if event_id else None
         payload = (event or {}).get("payload_json") or {}

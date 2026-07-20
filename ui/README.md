@@ -84,6 +84,6 @@ REDIS_ALLOW_MEMORY_FALLBACK=true uv run uvicorn ui.app:app --reload --host 127.0
 - 对话测试：发送后会显示“请求链路”，包括请求输入、上下文读取、滚动摘要、偏好记忆、最近对话、短期记忆 / 当前 Session、日期总结抽取、动作事件路由、SQLite 写入、回复模型输入和回复模型输出。
 - 短期记忆：会话列表可点击；选中 session 后展示历史会话消息；会话摘要只显示达到滚动摘要条件后写入 SQLite 的真实摘要。
 - 结构化偏好：长期记忆页按“职业 / 喜欢 / 明确不喜欢”三类展示偏好记忆，其他旧 key 或 candidate 放在“其他 / 历史偏好”里；按钮默认 `force=true`，会重跑当前滚动摘要 + 摘要证据原话 + 最近 5 轮完整会话 + 最近动作事件，并显示事件范围、摘要版本、最近轮次数、输入事件数、claimed、succeeded、failed、recovered 和错误详情。后端返回纯文本错误时页面会直接显示错误文本，不再显示 JSON parse 报错。
-- 日期总结：日期总结页保存 `event_type='time_memory'` 的文本摘要，`content` 是当天做过事情的总结，`payload_json.memory_date` 是归属日期，`payload_json.memory_at` 是带时区时间戳；页面只允许按日期从当天会话重跑抽取，不提供手写摘要入口。
-- 事件库：事件库页调用 `/api/memories/events-text`，只显示 text 记忆，不展示 `payload_json`；按日期展示机器狗事件链路，链路内标注用户反馈；7 天列表显示重复出现至少两天的 `action_preference_memory`。
+- 日期总结：日期总结页保存 `event_type='time_memory'` 的文本摘要，`content` 是当天做过事情的总结，`payload_json.memory_date` 是归属日期，`payload_json.memory_at` 是带时区时间戳；后台默认每天北京时间 01:00 自动抽取前一天，页面只允许按日期重跑，不提供手写摘要入口。
+- 事件库：事件库页调用 `/api/memories/events-text`，只显示 text 记忆，不展示 `payload_json`；后台每天 01:00 抽取前一天机器狗事件链路，每周一聚合上周一至周日的重复动作链；链路内标注用户反馈，7 天列表显示 `action_preference_memory`。
 - 设备状态：设备实时状态页可查询最新快照、历史记录，也可本地调试写入 `battery_percent`、`charging`、`network`、`location`、`motion_state`、`temperature_c`。
