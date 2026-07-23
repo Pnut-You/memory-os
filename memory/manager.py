@@ -843,7 +843,12 @@ class MemoryManager:
             "weekly_created": created_weekly,
         }
 
-    def process_memory_jobs_once(self, limit: int | None = None, include_daily: bool = False) -> dict[str, Any]:
+    def process_memory_jobs_once(
+        self,
+        limit: int | None = None,
+        include_daily: bool = False,
+        job_types: set[str] | None = None,
+    ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "claimed": 0,
             "processed": 0,
@@ -853,10 +858,10 @@ class MemoryManager:
             "recovered_stale": self.events.recover_stale_running_jobs(),
             "errors": [],
         }
-        jobs = self.events.claim_jobs(
-            limit or self.preference_extract_batch_size,
-            max_attempts=self.preference_extract_max_attempts,
-            job_types={
+        selected_job_types = (
+            job_types
+            if job_types is not None
+            else {
                 "conversation_summary",
                 "preference_extraction",
                 "user_card_rebuild",
@@ -865,7 +870,12 @@ class MemoryManager:
                 "weekly_action_preference_extract",
             }
             if include_daily
-            else {"conversation_summary", "preference_extraction", "user_card_rebuild"},
+            else {"conversation_summary", "preference_extraction", "user_card_rebuild"}
+        )
+        jobs = self.events.claim_jobs(
+            limit or self.preference_extract_batch_size,
+            max_attempts=self.preference_extract_max_attempts,
+            job_types=selected_job_types,
         )
         result["claimed"] = len(jobs)
         for job in jobs:
@@ -955,7 +965,13 @@ class MemoryManager:
                 "memory_date": memory_date,
                 "created_jobs": [],
                 "message": "指定日期没有可抽取的会话或动作事件",
-                "process": self.process_memory_jobs_once(limit=1, include_daily=True) if process_now else None,
+                "process": self.process_memory_jobs_once(
+                    limit=1,
+                    include_daily=True,
+                    job_types={"daily_time_memory_extract"},
+                )
+                if process_now
+                else None,
             }
         from_event_id = max(0, min(selected_ids) - 1)
         to_event_id = max(selected_ids)
@@ -976,7 +992,13 @@ class MemoryManager:
             "from_event_id": from_event_id,
             "to_event_id": to_event_id,
             "created_jobs": created_jobs,
-            "process": self.process_memory_jobs_once(limit=2, include_daily=True) if process_now else None,
+            "process": self.process_memory_jobs_once(
+                limit=1,
+                include_daily=True,
+                job_types={"daily_time_memory_extract"},
+            )
+            if process_now
+            else None,
         }
 
     def trigger_weekly_action_preference_extraction(

@@ -2040,6 +2040,35 @@ class MemorySystemTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_daily_time_memory_reads_all_same_day_sessions_from_sqlite(self):
+        manager = self.make_manager()
+        manager.summarizer = FixedSummarizer("当天跨三个会话完成了全部记录。")
+        try:
+            session_ids = []
+            for index, hour in enumerate((7, 13, 21), 1):
+                result = manager.add_conversation_turn(
+                    f"sqlite-day-{index}",
+                    "user-001",
+                    "dog-001",
+                    f"第{index}段会话事实",
+                    f"已记录第{index}段事实",
+                    timestamp=f"2026-07-02T{hour:02d}:00:00+08:00",
+                )
+                session_ids.append(result["session_id"])
+            self.assertEqual(len(set(session_ids)), 3)
+            trigger = manager.trigger_daily_extraction("user-001", "dog-001", "2026-07-02")
+            self.assertEqual(len(trigger["created_jobs"]), 1)
+            self.assertEqual(trigger["process"]["succeeded"], 1)
+            memories = manager.events.list_time_memories("user-001", "dog-001")
+            self.assertEqual(len(memories), 1)
+            payload = memories[0]["payload_json"]
+            self.assertEqual(payload["metadata"]["message_count"], 6)
+            self.assertEqual(payload["metadata"]["session_ids"], sorted(session_ids))
+            self.assertEqual(len(payload["source_event_ids"]), 6)
+            self.assertEqual(len(manager.summarizer.calls[0]["messages"]), 6)
+        finally:
+            manager.close()
+
     def test_daily_scheduler_waits_until_one_and_is_idempotent(self):
         manager = self.make_manager()
         try:

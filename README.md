@@ -491,6 +491,54 @@ uv run python evaluation/run_short_term_eval.py --max-cases 5 --log-file evaluat
 uv run python evaluation/run_short_term_eval.py --allow-memory-redis-fallback
 ```
 
+时间记忆评测检查“同一自然日全部 session 的 SQLite 原始会话 → 后台日期总结 → SQLite `time_memory`”链路是否完整、准确地保留事实。SQLite 是摘要生成时的唯一事实源：评测会先把每个 Case 的全部 session 写入临时 SQLite，再调用与生产一致的日期抽取入口；数据文件中的原始消息只供 Judge 核验，不会绕过 SQLite 直接生成摘要。默认数据集为 `evaluation/datasets/time_memory_probe.jsonl`，单一文件包含升级后的 100 条基础 Case 和 30 条多事实困难 Case，共 130 条；每条 Expected Fact 都包含完整事实文本和不可丢失的 `critical_slots`，不再使用零散关键词。
+
+130 个 Case 共覆盖 451 个 session 和 2,549 轮 user/assistant 对话。每个 Case 有 1～6 个 session，固定分布为 `1:22、2:22、3:22、4:22、5:21、6:21`；每个 session 为 1～10 轮，各轮数均有覆盖；每个 Case 合计 6～41 轮。数据内的 `session_profile` 保存预期 session/轮数，加载时会校验分布。完整构造和本次结果见根目录 `timememorytest.md`。
+
+正式评测必须配置 `DASHSCOPE_API_KEY` 或 `LLM_API_KEY`，并严格调用当前日期摘要模型。模型请求失败时 Case 直接失败，不允许本地摘要 fallback 计入正式成绩：
+
+```bash
+uv run python evaluation/run_time_memory_eval.py
+```
+
+唯一正式命令会先运行 40 条人工固定标签的 Judge 校准；校准准确率低于 90% 时不会继续正式评测。校准通过后测试全部 130 条，并自动生成 21 条反事实验证：
+
+```bash
+uv run python evaluation/run_time_memory_eval.py
+```
+
+控制台会实时显示校准的人工标签与 Judge 预测标签、每个正式 Fact 的四级结果以及每条反事实是否被拒绝。`PARTIAL_MATCH`、`MISMATCH` 和评测错误会额外显示缺失槽位、冲突槽位、幻觉与 Judge 原因；运行结束后打印校准矩阵和正式指标表。例如：
+
+```text
+[CAL 02/40] cal_exact_002  expected=EXACT_MATCH  predicted=EXACT_MATCH  PASS  1.4s
+[CASE 001/130] time_001  facts=1  summary_chars=428
+  [FACT 1] SEMANTIC_MATCH  PASS
+    expected: 备用钥匙放在青瓷花瓶旁边。
+    preserved: object, location
+  CASE RESULT: PASS
+[CF 01/21] time_061  mutation=person/recipient  predicted=MISMATCH  REJECTED
+```
+
+人类可读过程信息写入 `stderr`，最终完整报告仍以 JSON 写入 `stdout`，因此现有脚本可以继续解析结果。校准样本只验证 Judge 是否可靠，不计入正式 Time Memory Accuracy；正式指标只统计 `time_001` 至 `time_130`。
+
+也可只运行 Judge 校准，或在调试时限制 Case：
+
+```bash
+uv run python evaluation/run_time_memory_judge_calibration.py
+uv run python evaluation/run_time_memory_eval.py --max-cases 5
+uv run python evaluation/run_time_memory_eval.py --case-id time_001
+```
+
+严格 Judge 对每条 Fact 同时读取当天从 SQLite 写入并重新读取的全部 session 原始消息、完整 Expected Fact、Critical Slots 和生成摘要。结果分为 `EXACT_MATCH`、`SEMANTIC_MATCH`、`PARTIAL_MATCH` 和 `MISMATCH`；人物、物品、位置、时间、数量、否定、完成状态、最新状态和事实关系都必须正确。规则结果只作为诊断，不绕过 Judge；同一摘要发现任何无来源幻觉时，该 Case 的全部 Fact 均降为 `MISMATCH`。
+
+最终报告输出四类 Fact 数量、`fact_total`、`strict_accuracy`、`coverage_score`、`hallucination_count`、Case PASS 率、校准混淆矩阵/Precision/Recall/F1 和 `counterfactual_rejection_rate`。`strict_accuracy = (Exact + Semantic) / fact_total`；`coverage_score = (Exact + Semantic + 0.5 × Partial) / fact_total`。逐 Case 日志、全部 Partial/Mismatch 与抽样正确项的 review 文件、校准预测和反事实明细均写入 `evaluation/results/`。模型超时或非法输出记为 `evaluation_error`，不伪装成 Mismatch。
+
+只有本地调试 Redis 连接时才允许内存 fallback：
+
+```bash
+uv run python evaluation/run_time_memory_eval.py --max-cases 5 --allow-memory-redis-fallback
+```
+
 长期结构化偏好记忆评测检查 SQLite 中最终保存的 `profile.occupation`、`preference.likes`、`preference.dislikes` 以及确定性 Verification。默认数据集 60 条，职业、喜欢、不喜欢各 20 条。每个 Case 使用独立运行时 `user_id`、临时 SQLite 和随机 Redis 前缀，不共享长期偏好状态：
 
 ```bash
@@ -594,5 +642,6 @@ uv run uvicorn ui.app:app \
 uv run python -m unittest discover -s tests -v
 uv run python example.py
 uv run python evaluation/run_short_term_eval.py
+uv run python evaluation/run_time_memory_eval.py
 uv run python evaluation/run_preference_eval.py
 ```
