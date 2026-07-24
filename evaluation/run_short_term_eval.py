@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import urllib.request
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -32,6 +33,138 @@ DEFAULT_DATASET = PROJECT_ROOT / "evaluation" / "datasets" / "short_term_memory_
 EXPECTED_DEFAULT_CASE_COUNT = 400
 MIN_TURNS = 2
 MAX_TURNS = 20
+JUDGE_PROMPT_VERSION = "short-term-memory-judge-v1"
+
+
+class JudgeError(RuntimeError):
+    def __init__(self, message: str, *, attempts: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(message)
+        self.attempts = attempts or []
+
+
+class ShortTermMemoryJudge:
+    """Judge one short-term-memory reply using the configured project LLM."""
+
+    def __init__(self, api_key: str, base_url: str, model: str) -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    def judge(
+        self,
+        *,
+        case_id: str,
+        conversation: list[dict[str, Any]],
+        probe_question: str,
+        expected: dict[str, Any],
+        reply: str,
+    ) -> dict[str, Any]:
+        request_body = {
+            "case_id": case_id,
+            "conversation": conversation,
+            "probe_question": probe_question,
+            "expected": expected,
+            "reply": reply,
+        }
+        payload = {
+            "model": self.model,
+            "enable_thinking": False,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": short_term_judge_prompt()},
+                {"role": "user", "content": json.dumps(request_body, ensure_ascii=False)},
+            ],
+        }
+        attempts: list[dict[str, Any]] = []
+        for attempt_number in range(1, 3):
+            raw_output = ""
+            started = time.monotonic()
+            try:
+                request = urllib.request.Request(
+                    f"{self.base_url}/chat/completions",
+                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=75) as response:
+                    response_payload = json.loads(response.read().decode("utf-8"))
+                raw_output = str(response_payload["choices"][0]["message"]["content"]).strip()
+                result = validate_judge_result(json.loads(extract_json_object(raw_output)))
+                result.update(
+                    {
+                        "raw_output": raw_output,
+                        "attempt": attempt_number,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "model": self.model,
+                        "prompt_version": JUDGE_PROMPT_VERSION,
+                    }
+                )
+                return result
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "attempt": attempt_number,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "raw_output": raw_output,
+                    }
+                )
+        raise JudgeError(
+            f"short-term judge failed after 2 attempts: {attempts[-1]['error']}",
+            attempts=attempts,
+        )
+
+
+def short_term_judge_prompt() -> str:
+    return (
+        "你是严格的短期记忆回答评测器。输入包含完整会话、probe_question、expected 和模型实际 reply。"
+        "expected.must_contain 是历史兼容字段，仅表示语义参考答案，不要求其中原文完整出现在 reply 中，"
+        "也不得用关键词包含关系直接判分。\n"
+        "请结合完整会话和问题的时间指向，判断 reply 是否正确回答了 probe_question。"
+        "允许我→你/您等正常对话人称转换、同义改写、语序变化，以及省略“帮我、一下、的”等非核心词。"
+        "例如“C35编号”回答为“C35”、“等我准备散步”回答为“等你准备散步”，应判为正确。\n"
+        "必须严格核对核心实体、动作、实体与位置的绑定关系、时间、数量、否定含义和状态。"
+        "不同实体的信息不能互相覆盖或混淆。同一实体多次更新时，询问当前/现在状态必须使用最新状态；"
+        "询问某次更新之前的历史状态时必须回答对应旧状态。普通干扰语句不能被当作目标字段更新。\n"
+        "若 reply 遗漏核心事实、只回答其他事实、混淆实体、使用错误时间或位置、颠倒肯定/否定、"
+        "把旧状态当成当前状态，或与 expected 及完整会话矛盾，passed 必须为 false。"
+        "例如 expected 是“等我接完电话”，reply 是“休息五分钟”，必须判为 false。\n"
+        "只输出一个 JSON 对象，不要输出 Markdown、解释前缀或额外字段："
+        '{"passed":true,"reason":"回答正确保留了目标事实，仅发生正常人称转换"}'
+    )
+
+
+def extract_json_object(value: str) -> str:
+    text = str(value).strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("judge output does not contain a JSON object")
+    return text[start : end + 1]
+
+
+def validate_judge_result(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("judge output must be an object")
+    if set(value) != {"passed", "reason"}:
+        raise ValueError("judge output must contain exactly passed and reason")
+    passed = value.get("passed")
+    reason = value.get("reason")
+    if not isinstance(passed, bool):
+        raise ValueError("judge passed must be a boolean")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("judge reason must be a non-empty string")
+    return {"passed": passed, "reason": reason.strip()}
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,6 +208,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Write per-case input/output records to this JSONL file. Defaults to evaluation/results/short_term_eval_<timestamp>.jsonl.",
+    )
+    parser.add_argument(
+        "--badcase-file",
+        type=Path,
+        default=None,
+        help="Write only Judge-rejected cases to this JSONL file. Defaults beside --log-file with a _badcases suffix.",
     )
     return parser.parse_args()
 
@@ -322,7 +461,11 @@ def write_case_conversation(manager: MemoryManager, case: dict[str, Any]) -> str
     return session_id
 
 
-def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> dict[str, Any]:
+def evaluate_case(
+    case: dict[str, Any],
+    judge: ShortTermMemoryJudge,
+    allow_memory_redis_fallback: bool,
+) -> dict[str, Any]:
     redis_prefix = f"memory-os-short-eval:{case['case_id']}:{uuid.uuid4().hex}"
     started = time.monotonic()
     record: dict[str, Any] = {
@@ -336,9 +479,13 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
         "probe_question": str(case["probe_question"]),
         "expected": case["expected"],
         "assistant_reply": "",
-        "passed": False,
+        "status": "PENDING",
+        "passed": None,
         "reason": "",
         "llm_called": False,
+        "judge_called": False,
+        "judge_result": None,
+        "judge_attempts": [],
         "llm_model": "",
         "redis_prefix": redis_prefix,
         "redis_cleanup": {"redis_prefix": redis_prefix, "deleted": 0, "errors": []},
@@ -356,6 +503,7 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
                 session_id=actual_session_id,
             )
             if pre_probe_context.get("session_id") != actual_session_id:
+                record["status"] = "EVALUATION_ERROR"
                 record["reason"] = f"wrong session context: {pre_probe_context.get('session_id')}"
                 return record
             router = MemoryDebugRouter(manager, make_llm(config))
@@ -376,18 +524,27 @@ def evaluate_case(case: dict[str, Any], allow_memory_redis_fallback: bool) -> di
             record["normalized_expected"] = [
                 normalize_match_text(str(keyword)) for keyword in case["expected"]["must_contain"]
             ]
-            for keyword, normalized_keyword in zip(
-                case["expected"]["must_contain"], record["normalized_expected"]
-            ):
-                if normalized_keyword not in normalized_reply:
-                    record["reason"] = (
-                        f"missing normalized keyword: {keyword} "
-                        f"(normalized={normalized_keyword!r}, reply={normalized_reply!r})"
-                    )
-                    return record
-            record["passed"] = True
+            record["judge_called"] = True
+            try:
+                judge_result = judge.judge(
+                    case_id=str(case["case_id"]),
+                    conversation=case["conversation"],
+                    probe_question=str(case["probe_question"]),
+                    expected=case["expected"],
+                    reply=reply,
+                )
+            except JudgeError as exc:
+                record["status"] = "JUDGE_ERROR"
+                record["reason"] = str(exc)
+                record["judge_attempts"] = exc.attempts
+                return record
+            record["judge_result"] = judge_result
+            record["passed"] = bool(judge_result["passed"])
+            record["status"] = "PASS" if record["passed"] else "FAIL"
+            record["reason"] = str(judge_result["reason"])
             return record
         except Exception as exc:
+            record["status"] = "REPLY_ERROR" if record.get("llm_called") else "EVALUATION_ERROR"
             record["reason"] = f"{type(exc).__name__}: {exc}"
             return record
         finally:
@@ -443,8 +600,11 @@ def format_log_record(record: dict[str, Any]) -> dict[str, Any]:
         "assistant_reply": record.get("assistant_reply"),
         "normalized_expected": record.get("normalized_expected") or [],
         "normalized_reply": record.get("normalized_reply") or "",
-        "passed": bool(record.get("passed")),
+        "status": record.get("status"),
+        "passed": record.get("passed"),
         "reason": record.get("reason") or "",
+        "judge_result": record.get("judge_result"),
+        "judge_attempts": record.get("judge_attempts") or [],
         "elapsed_seconds": record.get("elapsed_seconds"),
         "redis_cleanup": record.get("redis_cleanup"),
         "debug": {
@@ -454,6 +614,7 @@ def format_log_record(record: dict[str, Any]) -> dict[str, Any]:
             "actual_session_id": record.get("actual_session_id"),
             "request_id": record.get("request_id"),
             "llm_called": bool(record.get("llm_called")),
+            "judge_called": bool(record.get("judge_called")),
             "llm_model": record.get("llm_model"),
             "redis_prefix": record.get("redis_prefix"),
             "conversation": record.get("conversation") or [],
@@ -463,7 +624,7 @@ def format_log_record(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def print_case_record(index: int, total: int, record: dict[str, Any]) -> None:
-    status = "PASS" if record.get("passed") else "FAIL"
+    status = str(record.get("status") or "EVALUATION_ERROR")
     print(
         f"[{index}/{total}] {record['case_id']} {status} "
         f"turns={record.get('turn_count')} fact_turn={record.get('fact_turn')} "
@@ -474,11 +635,23 @@ def print_case_record(index: int, total: int, record: dict[str, Any]) -> None:
     print(f"  expected: {expected_text(record)}", file=sys.stderr, flush=True)
     print(f"  question: {record.get('probe_question')}", file=sys.stderr, flush=True)
     print(f"  answer: {compact_text(str(record.get('assistant_reply') or ''))}", file=sys.stderr, flush=True)
-    if not record.get("passed"):
+    if status != "PASS":
         print(f"  reason: {record.get('reason') or 'unknown failure'}", file=sys.stderr, flush=True)
     cleanup = record.get("redis_cleanup") or {}
     if cleanup.get("errors"):
         print(f"  cleanup_errors: {cleanup.get('errors')}", file=sys.stderr, flush=True)
+
+
+def badcase_output(record: dict[str, Any]) -> dict[str, Any]:
+    judge_result = record.get("judge_result") if isinstance(record.get("judge_result"), dict) else {}
+    return {
+        "case_id": str(record["case_id"]),
+        "conversation": record.get("conversation") or [],
+        "question": str(record.get("probe_question") or ""),
+        "expected": record.get("expected") or {},
+        "reply": str(record.get("assistant_reply") or ""),
+        "judge_reason": str(judge_result.get("reason") or record.get("reason") or ""),
+    }
 
 
 def run() -> int:
@@ -509,25 +682,52 @@ def run() -> int:
         return 2
 
     log_file = args.log_file or default_log_file()
+    badcase_file = args.badcase_file or log_file.with_name(f"{log_file.stem}_badcases.jsonl")
+    if log_file.resolve() == badcase_file.resolve():
+        print("--log-file and --badcase-file must be different paths", file=sys.stderr)
+        return 2
     log_file.parent.mkdir(parents=True, exist_ok=True)
+    badcase_file.parent.mkdir(parents=True, exist_ok=True)
     print(f"case log: {log_file}", file=sys.stderr)
+    print(f"badcase log: {badcase_file}", file=sys.stderr)
 
     total_cases = len(cases)
     passed = 0
+    judged_cases = 0
     failed_cases: list[dict[str, str]] = []
+    judge_errors: list[dict[str, Any]] = []
+    reply_errors: list[dict[str, Any]] = []
+    evaluation_errors: list[dict[str, Any]] = []
     llm_calls = 0
+    judge_calls = 0
     redis_cleaned_cases = 0
     redis_cleanup_errors: list[dict[str, Any]] = []
-    with log_file.open("w", encoding="utf-8") as log_handle:
+    judge_config = MemoryConfig.from_env()
+    judge = ShortTermMemoryJudge(
+        judge_config.llm_api_key,
+        judge_config.llm_base_url,
+        judge_config.llm_model,
+    )
+    with (
+        log_file.open("w", encoding="utf-8") as log_handle,
+        badcase_file.open("w", encoding="utf-8") as badcase_handle,
+    ):
         for index, case in enumerate(cases, 1):
             print(f"[{index}/{total_cases}] {case['case_id']} running...", file=sys.stderr, flush=True)
-            record = evaluate_case(case, args.allow_memory_redis_fallback)
+            record = evaluate_case(case, judge, args.allow_memory_redis_fallback)
             log_handle.write(json.dumps(format_log_record(record), ensure_ascii=False, sort_keys=True) + "\n")
             log_handle.flush()
             print_case_record(index, total_cases, record)
-            if record.get("passed"):
+            status = record.get("status")
+            if status in {"PASS", "FAIL"}:
+                judged_cases += 1
+            if status == "PASS":
                 passed += 1
-            else:
+            elif status == "FAIL":
+                badcase_handle.write(
+                    json.dumps(badcase_output(record), ensure_ascii=False, sort_keys=True) + "\n"
+                )
+                badcase_handle.flush()
                 failed_cases.append(
                     {
                         "case_id": str(record["case_id"]),
@@ -535,8 +735,32 @@ def run() -> int:
                         "reply": str(record.get("assistant_reply") or ""),
                     }
                 )
+            elif status == "JUDGE_ERROR":
+                judge_errors.append(
+                    {
+                        "case_id": str(record["case_id"]),
+                        "reason": str(record.get("reason") or ""),
+                        "attempts": record.get("judge_attempts") or [],
+                    }
+                )
+            elif status == "REPLY_ERROR":
+                reply_errors.append(
+                    {
+                        "case_id": str(record["case_id"]),
+                        "reason": str(record.get("reason") or ""),
+                    }
+                )
+            elif status == "EVALUATION_ERROR":
+                evaluation_errors.append(
+                    {
+                        "case_id": str(record["case_id"]),
+                        "reason": str(record.get("reason") or ""),
+                    }
+                )
             if record.get("llm_called"):
                 llm_calls += 1
+            if record.get("judge_called"):
+                judge_calls += 1
             cleanup = record.get("redis_cleanup") or {}
             if not cleanup.get("errors"):
                 redis_cleaned_cases += 1
@@ -568,13 +792,22 @@ def run() -> int:
         redis_cleaned_cases += 1
     output = {
         "total_cases": total_cases,
-        "accuracy": accuracy(passed, total_cases),
+        "accuracy": accuracy(passed, judged_cases),
         "llm_model": preflight.get("llm_model"),
         "llm_calls": llm_calls,
+        "judge_calls": judge_calls,
+        "judged_cases": judged_cases,
+        "judge_error_cases": len(judge_errors),
+        "reply_error_cases": len(reply_errors),
+        "evaluation_error_cases": len(evaluation_errors),
         "log_file": str(log_file),
+        "badcase_file": str(badcase_file),
         "redis_cleaned_cases": redis_cleaned_cases,
         "redis_cleanup_errors": redis_cleanup_errors,
         "failed_cases": failed_cases,
+        "judge_errors": judge_errors,
+        "reply_errors": reply_errors,
+        "evaluation_errors": evaluation_errors,
     }
     print(f"completed in {elapsed_seconds:.2f}s", file=sys.stderr)
     print(json.dumps(output, ensure_ascii=False, indent=2))
