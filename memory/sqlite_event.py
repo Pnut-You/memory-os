@@ -202,6 +202,9 @@ class SQLiteEventStore:
                 job_type TEXT NOT NULL,
                 from_event_id INTEGER,
                 to_event_id INTEGER,
+                schedule_key TEXT,
+                period_start TEXT,
+                period_end TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0,
                 available_at TEXT NOT NULL,
@@ -216,7 +219,6 @@ class SQLiteEventStore:
                 WHERE job_type='preference_extraction' AND session_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_jobs_ready
                 ON memory_jobs(status, available_at, id);
-
             CREATE TABLE IF NOT EXISTS tool_runs (
                 run_id TEXT PRIMARY KEY,
                 context_id TEXT NOT NULL,
@@ -259,6 +261,15 @@ class SQLiteEventStore:
         self._ensure_column("user_preferences", "device_id", "TEXT NOT NULL DEFAULT 'legacy-unassigned'")
         self._migrate_primary_preferences_to_user_scope()
         self._ensure_column("memory_jobs", "session_id", "TEXT")
+        self._ensure_column("memory_jobs", "schedule_key", "TEXT")
+        self._ensure_column("memory_jobs", "period_start", "TEXT")
+        self._ensure_column("memory_jobs", "period_end", "TEXT")
+        self._conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_memory_job
+            ON memory_jobs(user_id, device_id, job_type, schedule_key)
+            WHERE schedule_key IS NOT NULL"""
+        )
+        self._conn.commit()
         self._ensure_preference_device_indexes()
         self._ensure_column("events", "session_id", "TEXT")
         self._conn.execute(
@@ -1697,15 +1708,22 @@ class SQLiteEventStore:
         to_event_id: int | None = None,
         available_at: str | None = None,
         session_id: str | None = None,
+        schedule_key: str | None = None,
+        period_start: str | None = None,
+        period_end: str | None = None,
     ) -> int | None:
         now = iso_now()
         with self._lock:
             try:
                 cursor = self._conn.execute(
                     """INSERT INTO memory_jobs
-                    (user_id,device_id,session_id,job_type,from_event_id,to_event_id,status,available_at,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,'pending',?,?,?)""",
-                    (user_id, device_id, session_id, job_type, from_event_id, to_event_id, available_at or now, now, now),
+                    (user_id,device_id,session_id,job_type,from_event_id,to_event_id,
+                     schedule_key,period_start,period_end,status,available_at,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)""",
+                    (
+                        user_id, device_id, session_id, job_type, from_event_id, to_event_id,
+                        schedule_key, period_start, period_end, available_at or now, now, now,
+                    ),
                 )
                 self._conn.commit()
                 return int(cursor.lastrowid)
@@ -1720,7 +1738,64 @@ class SQLiteEventStore:
                     )
                     self._conn.commit()
                     return None
+                if schedule_key:
+                    return None
                 raise
+
+    def list_conversation_scopes(
+        self,
+        start_date: str,
+        end_date: str,
+        timezone_name: str = "Asia/Shanghai",
+    ) -> list[dict[str, str]]:
+        start = datetime.fromisoformat(start_date).date()
+        end = datetime.fromisoformat(end_date).date()
+        raw_start = (start - timedelta(days=1)).isoformat()
+        raw_end = (end + timedelta(days=1)).isoformat()
+        with self._lock:
+            session_rows = self._conn.execute(
+                """SELECT DISTINCT user_id,device_id,local_date
+                FROM conversation_sessions
+                WHERE local_date BETWEEN ? AND ?
+                ORDER BY local_date,user_id,device_id""",
+                (start_date, end_date),
+            ).fetchall()
+            event_rows = self._conn.execute(
+                """SELECT user_id,device_id,created_at FROM events
+                WHERE event_type='message' AND substr(created_at,1,10) BETWEEN ? AND ?""",
+                (raw_start, raw_end),
+            ).fetchall()
+        scopes = {
+            (str(row["user_id"]), str(row["device_id"]), str(row["local_date"]))
+            for row in session_rows
+        }
+        for row in event_rows:
+            local_date = self._local_date(row["created_at"], timezone_name)
+            if start_date <= local_date <= end_date:
+                scopes.add((str(row["user_id"]), str(row["device_id"]), local_date))
+        return [
+            {"user_id": user_id, "device_id": device_id, "local_date": local_date}
+            for user_id, device_id, local_date in sorted(scopes, key=lambda item: (item[2], item[0], item[1]))
+        ]
+
+    def scheduled_jobs_succeeded(
+        self,
+        user_id: str,
+        device_id: str,
+        job_type: str,
+        schedule_keys: list[str],
+    ) -> bool:
+        if not schedule_keys:
+            return True
+        placeholders = ",".join("?" for _ in schedule_keys)
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT COUNT(*) AS count FROM memory_jobs
+                WHERE user_id=? AND device_id=? AND job_type=?
+                    AND schedule_key IN ({placeholders}) AND status='succeeded'""",
+                (user_id, device_id, job_type, *schedule_keys),
+            ).fetchone()
+        return int(row["count"] or 0) == len(set(schedule_keys))
 
     def upsert_pending_device_job(
         self,
@@ -2183,6 +2258,9 @@ class SQLiteEventStore:
                     job_type TEXT NOT NULL,
                     from_event_id INTEGER,
                     to_event_id INTEGER,
+                    schedule_key TEXT,
+                    period_start TEXT,
+                    period_end TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
                     available_at TEXT NOT NULL,
@@ -2196,9 +2274,11 @@ class SQLiteEventStore:
             )
             self._conn.execute(
                 """INSERT INTO memory_jobs
-                (id,user_id,device_id,session_id,job_type,from_event_id,to_event_id,status,attempts,
+                (id,user_id,device_id,session_id,job_type,from_event_id,to_event_id,
+                 schedule_key,period_start,period_end,status,attempts,
                  available_at,locked_at,last_error,created_at,updated_at)
-                SELECT id,user_id,device_id,NULL,job_type,from_event_id,to_event_id,status,attempts,
+                SELECT id,user_id,device_id,NULL,job_type,from_event_id,to_event_id,
+                    NULL,NULL,NULL,status,attempts,
                     available_at,locked_at,last_error,created_at,updated_at
                 FROM memory_jobs_old"""
             )
@@ -2210,6 +2290,11 @@ class SQLiteEventStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_ready ON memory_jobs(status, available_at, id)"
+            )
+            self._conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_memory_job
+                ON memory_jobs(user_id, device_id, job_type, schedule_key)
+                WHERE schedule_key IS NOT NULL"""
             )
             self._conn.commit()
 

@@ -1997,7 +1997,7 @@ class MemorySystemTests(unittest.TestCase):
             self.assertIn("daily_memory_extraction", names)
             self.assertIn("llm_prompt_messages", names)
             time_step = next(step for step in steps if step["name"] == "daily_memory_extraction")
-            self.assertEqual(time_step["status"], "queued")
+            self.assertEqual(time_step["status"], "deferred")
             self.assertEqual(time_step["title_zh"], "日期总结抽取")
             self.assertRegex(time_step["data"]["memory_date"], r"^\d{4}-\d{2}-\d{2}$")
         finally:
@@ -2024,14 +2024,108 @@ class MemorySystemTests(unittest.TestCase):
                 timestamp="2026-07-02T09:00:00+08:00",
             )
             self.assertIn("daily_extraction", result)
+            self.assertTrue(result["daily_extraction"]["deferred"])
             self.assertEqual(manager.events.list_time_memories("user-001", "dog-001"), [])
+            scheduled = manager.schedule_due_memory_jobs(
+                datetime(2026, 7, 3, 1, 0, tzinfo=timezone(timedelta(hours=8)))
+            )
+            self.assertEqual(len(scheduled["daily_created"]), 2)
             process = manager.process_memory_jobs_once(limit=2, include_daily=True)
-            self.assertEqual(process["succeeded"], 1)
+            self.assertEqual(process["succeeded"], 2)
             memories = manager.events.list_time_memories("user-001", "dog-001")
             self.assertEqual(len(memories), 1)
             self.assertEqual(memories[0]["payload_json"]["memory_date"], "2026-07-02")
             self.assertIn("当天完成了客厅巡检", memories[0]["content"])
             self.assertEqual(memories[0]["payload_json"]["metadata"]["message_count"], 2)
+        finally:
+            manager.close()
+
+    def test_daily_time_memory_reads_all_same_day_sessions_from_sqlite(self):
+        manager = self.make_manager()
+        manager.summarizer = FixedSummarizer("当天跨三个会话完成了全部记录。")
+        try:
+            session_ids = []
+            for index, hour in enumerate((7, 13, 21), 1):
+                result = manager.add_conversation_turn(
+                    f"sqlite-day-{index}",
+                    "user-001",
+                    "dog-001",
+                    f"第{index}段会话事实",
+                    f"已记录第{index}段事实",
+                    timestamp=f"2026-07-02T{hour:02d}:00:00+08:00",
+                )
+                session_ids.append(result["session_id"])
+            self.assertEqual(len(set(session_ids)), 3)
+            trigger = manager.trigger_daily_extraction("user-001", "dog-001", "2026-07-02")
+            self.assertEqual(len(trigger["created_jobs"]), 1)
+            self.assertEqual(trigger["process"]["succeeded"], 1)
+            memories = manager.events.list_time_memories("user-001", "dog-001")
+            self.assertEqual(len(memories), 1)
+            payload = memories[0]["payload_json"]
+            self.assertEqual(payload["metadata"]["message_count"], 6)
+            self.assertEqual(payload["metadata"]["session_ids"], sorted(session_ids))
+            self.assertEqual(len(payload["source_event_ids"]), 6)
+            self.assertEqual(len(manager.summarizer.calls[0]["messages"]), 6)
+        finally:
+            manager.close()
+
+    def test_daily_scheduler_waits_until_one_and_is_idempotent(self):
+        manager = self.make_manager()
+        try:
+            manager.add_conversation_turn(
+                "scheduled-daily-boundary",
+                "user-001",
+                "dog-001",
+                "巡检客厅",
+                "已完成",
+                timestamp="2026-07-02T20:00:00+08:00",
+            )
+            before = manager.schedule_due_memory_jobs(
+                datetime(2026, 7, 3, 0, 59, tzinfo=timezone(timedelta(hours=8)))
+            )
+            self.assertEqual(before["backfill_end"], "2026-07-01")
+            self.assertEqual(before["daily_created"], [])
+            due = manager.schedule_due_memory_jobs(
+                datetime(2026, 7, 3, 1, 0, tzinfo=timezone(timedelta(hours=8)))
+            )
+            self.assertEqual(
+                {item["job_type"] for item in due["daily_created"]},
+                {"daily_time_memory_extract", "daily_action_memory_extract"},
+            )
+            duplicate = manager.schedule_due_memory_jobs(
+                datetime(2026, 7, 3, 8, 0, tzinfo=timezone(timedelta(hours=8)))
+            )
+            self.assertEqual(duplicate["daily_created"], [])
+            jobs = manager.events.list_jobs("user-001", limit=20)
+            self.assertEqual(len([job for job in jobs if job.get("schedule_key") == "2026-07-02"]), 2)
+        finally:
+            manager.close()
+
+    def test_scheduler_backfills_only_latest_thirty_completed_days(self):
+        manager = self.make_manager()
+        try:
+            manager.add_conversation_turn(
+                "backfill-too-old",
+                "user-001",
+                "dog-001",
+                "旧对话",
+                "旧回复",
+                timestamp="2026-06-01T09:00:00+08:00",
+            )
+            manager.add_conversation_turn(
+                "backfill-in-range",
+                "user-001",
+                "dog-001",
+                "近期对话",
+                "近期回复",
+                timestamp="2026-06-02T09:00:00+08:00",
+            )
+            result = manager.schedule_due_memory_jobs(
+                datetime(2026, 7, 2, 1, 0, tzinfo=timezone(timedelta(hours=8)))
+            )
+            self.assertEqual(result["backfill_start"], "2026-06-02")
+            keys = {item["memory_date"] for item in result["daily_created"]}
+            self.assertEqual(keys, {"2026-06-02"})
         finally:
             manager.close()
 
@@ -2594,6 +2688,55 @@ class MemorySystemTests(unittest.TestCase):
             self.assertEqual(result["process"]["skipped"], 1)
             self.assertEqual(result["process"]["jobs"][0]["model_extracted_memories"], 0)
             self.assertEqual(manager.events.list_action_preference_memories("user-001", "dog-001"), [])
+        finally:
+            manager.close()
+
+    def test_monday_scheduler_waits_for_daily_action_memory_then_queues_natural_week(self):
+        manager = self.make_manager()
+        manager.preference_extractor = FakeExtractor()
+        try:
+            manager.add_conversation_turn(
+                "scheduled-weekly-action",
+                "user-001",
+                "dog-001",
+                "坐下",
+                "好的",
+                timestamp="2026-07-02T09:00:00+08:00",
+                model_event_routes=[
+                    {
+                        "type": "action_sequence",
+                        "decision": "create",
+                        "confidence": 0.9,
+                        "actions": [{"code": "sit", "label_zh": "坐下"}],
+                    }
+                ],
+            )
+            first = manager.schedule_due_memory_jobs(
+                datetime(2026, 7, 6, 1, 0, tzinfo=timezone(timedelta(hours=8)))
+            )
+            self.assertEqual(first["weekly_created"], [])
+            process_daily = manager.process_memory_jobs_once(limit=20, include_daily=True)
+            self.assertEqual(process_daily["succeeded"], 2)
+            second = manager.schedule_due_memory_jobs(
+                datetime(2026, 7, 6, 1, 1, tzinfo=timezone(timedelta(hours=8)))
+            )
+            self.assertEqual(len(second["weekly_created"]), 1)
+            weekly = second["weekly_created"][0]
+            self.assertEqual(weekly["start_date"], "2026-06-29")
+            self.assertEqual(weekly["end_date"], "2026-07-05")
+            process_weekly = manager.process_memory_jobs_once(limit=20, include_daily=True)
+            self.assertEqual(process_weekly["succeeded"], 1)
+            self.assertEqual(process_weekly["skipped"], 1)
+            duplicate = manager.schedule_due_memory_jobs(
+                datetime(2026, 7, 6, 2, 0, tzinfo=timezone(timedelta(hours=8)))
+            )
+            self.assertEqual(duplicate["weekly_created"], [])
+            weekly_jobs = manager.events.list_jobs(
+                "user-001", "weekly_action_preference_extract", limit=20
+            )
+            self.assertEqual(len(weekly_jobs), 1)
+            self.assertEqual(weekly_jobs[0]["period_start"], "2026-06-29")
+            self.assertEqual(weekly_jobs[0]["period_end"], "2026-07-05")
         finally:
             manager.close()
 
